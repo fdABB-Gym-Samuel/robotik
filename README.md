@@ -36,7 +36,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Option B: conda
+### Option B: nix (best)
+This option requires the [nix package manager](https://nixos.org/download/)
+```bash
+nix develop
+```
+
+### Option C: conda
 
 ```bash
 conda env create -f environment.yml
@@ -46,7 +52,7 @@ conda activate robotics-humanoid-course
 ## Quick Start Guide
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt # Do not run this if your using the nix package manager
 python scripts/run_reacher.py
 ```
 
