@@ -17,8 +17,8 @@ This repository provides a practical path from simple robot control to humanoid 
 The course is designed for an 8-week classroom format with low setup friction. Students start running simulations in 10-15 minutes and then progress from:
 
 1. Reacher (arm control)
-2. Hopper (balance and locomotion)
-3. Humanoid (full-body control)
+1. Hopper (balance and locomotion)
+1. Humanoid (full-body control)
 
 Supporting documents for teachers and classroom safety are under `docs/`.
 

@@ -4,12 +4,10 @@ course:
   primary_language: "Python"
   simulator: "MuJoCo"
   rl_library: "Stable-Baselines3"
-
 environments:
   intro: "Reacher-v5"
   balance: "Hopper-v5"
   humanoid: "Humanoid-v5"
-
 runtime:
   default_timesteps: 50000
   save_dir: "runs/logs"

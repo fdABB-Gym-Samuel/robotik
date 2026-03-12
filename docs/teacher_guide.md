@@ -7,8 +7,8 @@ Help students build practical intuition for robotics control and reinforcement l
 ## Suggested Class Flow
 
 1. 10-15 min mini-lecture
-2. 25-35 min guided coding and simulation
-3. 10-15 min discussion and reflection
+1. 25-35 min guided coding and simulation
+1. 10-15 min discussion and reflection
 
 ## Teaching Tips
 

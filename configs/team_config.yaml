@@ -5,7 +5,6 @@ team:
   student_groups:
     - "Team A"
     - "Team B"
-
 project:
   focus: "Humanoid robot simulation"
   final_demo_week: 8

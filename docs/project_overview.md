@@ -2,19 +2,19 @@
 
 This document explains what every part of this project does, what the key technologies are, and how everything fits together.
 
----
+______________________________________________________________________
 
 ## What Is This Project?
 
 An 8-week hands-on course where high school students learn to control simulated robots using Python. The learning path moves from a simple robotic arm to a full humanoid:
 
 1. **Reacher** — a 2-joint arm that reaches toward a target
-2. **Hopper** — a one-legged robot that must balance and hop forward
-3. **Humanoid** — a full-body robot with dozens of joints that walks
+1. **Hopper** — a one-legged robot that must balance and hop forward
+1. **Humanoid** — a full-body robot with dozens of joints that walks
 
 Students start by running simulations with random actions, then learn classical control, and finally train AI agents using reinforcement learning.
 
----
+______________________________________________________________________
 
 ## Key Technologies Explained
 
@@ -48,10 +48,11 @@ Gymnasium provides ready-made environments like `Reacher-v5`, `Hopper-v5`, and `
 A **reinforcement learning library** that implements proven RL algorithms. This project uses **PPO (Proximal Policy Optimization)**, which trains a neural network to choose good actions based on observations.
 
 Instead of writing control rules by hand, PPO learns by trial and error:
+
 1. The robot tries random-ish actions
-2. It receives rewards for good behavior (moving forward, staying upright)
-3. The neural network gradually improves its action choices
-4. After thousands of episodes, the robot learns to walk, hop, or reach
+1. It receives rewards for good behavior (moving forward, staying upright)
+1. The neural network gradually improves its action choices
+1. After thousands of episodes, the robot learns to walk, hop, or reach
 
 ### PyTorch
 
@@ -65,7 +66,7 @@ A **numerical computing library** for Python. Used throughout for handling array
 
 A **plotting library** for creating charts and graphs. Useful for visualizing training progress, reward curves, and comparing controller performance.
 
----
+______________________________________________________________________
 
 ## Project Structure — What Each Part Does
 
@@ -81,6 +82,7 @@ These are the files you run directly.
 | `train_rl.py` | Trains a PPO agent on any environment. Saves the trained model and reports how well it performs. This is where the AI learning happens. |
 
 **Usage examples:**
+
 ```bash
 python scripts/run_reacher.py                           # Watch a random arm
 python scripts/train_rl.py --env Hopper-v5 --timesteps 50000  # Train a hopper AI
@@ -127,7 +129,7 @@ These serve as reference cards for what students should focus on at each stage.
 | `runs/logs/` | Trained model files (`.zip`) and training logs from `train_rl.py` |
 | `runs/videos/` | Recorded simulation videos (when enabled) |
 
----
+______________________________________________________________________
 
 ## Core Concepts
 
@@ -143,12 +145,12 @@ These serve as reference cards for what students should focus on at each stage.
 ```
 
 1. The **environment** (MuJoCo simulation) provides an **observation** (what the robot senses)
-2. The **agent** (neural network or controller) chooses an **action** (joint torques)
-3. The environment simulates one time step and returns:
+1. The **agent** (neural network or controller) chooses an **action** (joint torques)
+1. The environment simulates one time step and returns:
    - A new **observation**
    - A **reward** (how good that action was)
    - Whether the episode is **done** (robot fell, time limit reached)
-4. Repeat until the episode ends, then reset and start again
+1. Repeat until the episode ends, then reset and start again
 
 ### What the Robots Look Like
 
@@ -166,7 +168,7 @@ These serve as reference cards for what students should focus on at each stage.
 
 Starting simple lets students build intuition about how control works before tackling the complexity of a full humanoid.
 
----
+______________________________________________________________________
 
 ## Future Direction
 
@@ -177,7 +179,7 @@ The course is designed to eventually bridge from simulation to real hardware:
 
 This is covered conceptually in Week 7 of the course plan.
 
----
+______________________________________________________________________
 
 ## Dependencies Summary
 
