@@ -10,7 +10,7 @@ This repository provides a practical path from simple robot control to humanoid 
 - Understand rewards, observations, and actions
 - Compare random and simple controller behavior
 - Train reinforcement learning agents with Stable-Baselines3 (PPO)
-- Build toward future humanoid workflows (Ark framework and Unitree G1 integration)
+- Use a local Unitree G1 MuJoCo scene for humanoid-specific experiments
 
 ## Course Description
 
@@ -18,41 +18,23 @@ The course is designed for an 8-week classroom format with low setup friction. S
 
 1. Reacher (arm control)
 1. Hopper (balance and locomotion)
-1. Humanoid (full-body control)
+1. Unitree G1 (full-body control)
 
 Supporting documents for teachers and classroom safety are under `docs/`.
 
 ## Setup Instructions
 
-### Option A: pip (fastest)
+### Python venv
 
 ```bash
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
+chmod +x scripts/setup-venv
+./scripts/setup-venv
 source .venv/bin/activate
-
-pip install -r requirements.txt
-```
-
-### Option B: nix (best)
-This option requires the [nix package manager](https://nixos.org/download/)
-```bash
-nix develop
-```
-
-### Option C: conda
-
-```bash
-conda env create -f environment.yml
-conda activate robotics-humanoid-course
 ```
 
 ## Quick Start Guide
 
 ```bash
-pip install -r requirements.txt # Do not run this if your using the nix package manager
 python scripts/run_reacher.py
 ```
 
@@ -63,10 +45,16 @@ python scripts/run_hopper.py
 python scripts/run_humanoid.py
 ```
 
+For the Unitree G1 viewer on macOS, use:
+
+```bash
+./scripts/run-g1-sim
+```
+
 Train a reinforcement learning policy:
 
 ```bash
-python scripts/train_rl.py --env Hopper-v5 --timesteps 50000
+python scripts/train_rl.py --env UnitreeG1-v0 --timesteps 50000
 ```
 
 ## Repository Layout
@@ -75,8 +63,8 @@ python scripts/train_rl.py --env Hopper-v5 --timesteps 50000
 robotics-humanoid-course/
   README.md
   requirements.txt
-  environment.yml
   scripts/
+    setup-venv
     run_reacher.py
     run_hopper.py
     run_humanoid.py
@@ -88,6 +76,8 @@ robotics-humanoid-course/
     reacher_task/
     hopper_task/
     humanoid_task/
+  environments/
+    unitree_g1_env.py
   configs/
     course_config.yaml
     team_config.yaml
@@ -104,6 +94,7 @@ robotics-humanoid-course/
 
 - Python 3.10+ is recommended.
 - MuJoCo is installed automatically via `gymnasium[mujoco]`.
+- The humanoid workflow expects a local G1 scene at `assets/unitree_g1/g1_29dof_with_hand.xml`.
 - If rendering issues occur on school computers, use non-render mode first and confirm installation with headless runs.
 
 ## References
@@ -112,7 +103,6 @@ robotics-humanoid-course/
 - MuJoCo envs: https://gymnasium.farama.org/environments/mujoco/
 - Reacher: https://gymnasium.farama.org/environments/mujoco/reacher/
 - Hopper: https://gymnasium.farama.org/environments/mujoco/hopper/
-- Humanoid: https://gymnasium.farama.org/environments/mujoco/humanoid/
 - Stable-Baselines3: https://stable-baselines3.readthedocs.io/en/master/
 - MuJoCo docs: https://mujoco.readthedocs.io/en/stable/
 - Ark framework: https://github.com/Robotics-Ark/ark_framework
