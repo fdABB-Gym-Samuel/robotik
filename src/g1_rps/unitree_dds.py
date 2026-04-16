@@ -12,8 +12,6 @@ The message layout and topic names come from Unitree's official sources:
 - dfx_inspire_service
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 
 import cyclonedds.idl as idl
@@ -132,4 +130,3 @@ class UnitreeDdsSession:
             return None
         except DDSException as exc:
             raise RuntimeError(f"Failed to read Inspire hand state over DDS: {exc.msg}") from exc
-

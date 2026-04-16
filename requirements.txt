@@ -5,3 +5,4 @@ matplotlib>=3.7
 trimesh>=4.6
 torch>=2.0
 stable-baselines3>=2.3.0
+cyclonedds>=11.0.1

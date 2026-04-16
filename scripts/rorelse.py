@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import math
 import random
 import shutil
@@ -13,6 +14,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+for candidate in (PROJECT_ROOT, SRC_ROOT):
+    candidate_str = str(candidate)
+    if candidate_str not in sys.path:
+        sys.path.insert(0, candidate_str)
+
 try:
     import mujoco
     import mujoco.viewer
@@ -22,8 +30,9 @@ except ModuleNotFoundError as exc:  # pragma: no cover - import guard for local 
         "before starting the Unitree G1 viewer."
     ) from exc
 
+from scripts.run_g1_rps_hand_hardware import HardwareConfig as HardwareScriptConfig
+from scripts.run_g1_rps_hand_hardware import run_hardware_sequence as run_hand_hardware_sequence
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCENE_PATH = PROJECT_ROOT / "assets" / "unitree_g1" / "g1_29dof_with_hand.xml"
 LOG_PATH = PROJECT_ROOT / "runs" / "logs" / "rorelse-error.log"
 FRAME_DT = 1.0 / 60.0
@@ -59,12 +68,30 @@ class SpeechConfig:
 
 
 @dataclass(frozen=True)
+class HandBridgeConfig:
+    enabled: bool = True
+    live: bool = False
+    hand: str = "right"
+    transition_seconds: float = 0.18
+    hold_seconds: float = 1.7
+    rate_hz: float = 25.0
+    domain_id: int = 0
+    interface: str | None = None
+    command_topic: str = "rt/inspire/cmd"
+    state_topic: str = "rt/inspire/state"
+    state_timeout_seconds: float = 1.0
+    print_state: bool = False
+    return_to_open: bool = False
+
+
+@dataclass(frozen=True)
 class DemoConfig:
     scene_path: Path = SCENE_PATH
     frame_dt: float = FRAME_DT
     timing: TimingConfig = TimingConfig()
     motion: MotionConfig = MotionConfig()
     speech: SpeechConfig = SpeechConfig()
+    hand_hardware: HandBridgeConfig = HandBridgeConfig()
 
 
 @dataclass(frozen=True)
@@ -84,6 +111,7 @@ class DemoState:
     reveal_pose: dict[str, float]
     speech_playback: "SpeechPlayback | None" = None
     cycle_started_at: float = 0.0
+    hand_reveal_started: bool = False
 
 
 class SpeechBackend:
@@ -153,6 +181,80 @@ class SpeechPlayback:
 
     def close(self) -> None:
         self.backend.close()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the Unitree G1 rock-paper-scissors demo with MuJoCo body motion, "
+            "local speech, and an optional real Inspire hand reveal over DDS."
+        )
+    )
+    parser.add_argument(
+        "--live-hand",
+        action="store_true",
+        help="Publish the reveal gesture to the real Inspire hand over DDS.",
+    )
+    parser.add_argument(
+        "--disable-hand",
+        action="store_true",
+        help="Disable the imported hardware-hand trigger entirely.",
+    )
+    parser.add_argument(
+        "--interface",
+        default=None,
+        help="Optional CycloneDDS network interface, for example `en5` or `eth0`.",
+    )
+    parser.add_argument(
+        "--domain-id",
+        type=int,
+        default=0,
+        help="CycloneDDS domain ID used for the Inspire hand topics.",
+    )
+    parser.add_argument(
+        "--print-hand-state",
+        action="store_true",
+        help="Print outgoing hand commands and any received Inspire hand state.",
+    )
+    parser.add_argument(
+        "--hand",
+        choices=("right", "left"),
+        default="right",
+        help="Which physical Inspire hand to command.",
+    )
+    parser.add_argument(
+        "--hand-transition-seconds",
+        type=float,
+        default=0.18,
+        help="Seconds used to interpolate into the final reveal on the real hand.",
+    )
+    parser.add_argument(
+        "--hand-hold-seconds",
+        type=float,
+        default=1.7,
+        help="Seconds to hold the final reveal on the real hand.",
+    )
+    parser.add_argument(
+        "--return-hand-to-open",
+        action="store_true",
+        help="Return the real hand to the open paper pose after each reveal.",
+    )
+    return parser.parse_args()
+
+
+def build_demo_config(args: argparse.Namespace) -> DemoConfig:
+    hand_hardware = HandBridgeConfig(
+        enabled=not args.disable_hand,
+        live=args.live_hand,
+        hand=args.hand,
+        transition_seconds=args.hand_transition_seconds,
+        hold_seconds=args.hand_hold_seconds,
+        domain_id=args.domain_id,
+        interface=args.interface,
+        print_state=args.print_hand_state,
+        return_to_open=args.return_hand_to_open,
+    )
+    return DemoConfig(hand_hardware=hand_hardware)
 
 
 def choose_speech_backend(config: SpeechConfig) -> SpeechBackend:
@@ -350,6 +452,33 @@ def final_hand_pose(symbol: str, config: MotionConfig) -> dict[str, float]:
     return poses[symbol]
 
 
+def trigger_hardware_hand_gesture(state: DemoState) -> None:
+    hand_config = state.config.hand_hardware
+    if not hand_config.enabled:
+        return
+
+    def runner() -> None:
+        run_hand_hardware_sequence(
+            HardwareScriptConfig(
+                sequence=(state.symbol,),
+                transition_seconds=hand_config.transition_seconds,
+                hold_seconds=hand_config.hold_seconds,
+                rate_hz=hand_config.rate_hz,
+                hand=hand_config.hand,
+                domain_id=hand_config.domain_id,
+                network_interface=hand_config.interface,
+                command_topic=hand_config.command_topic,
+                state_topic=hand_config.state_topic,
+                state_timeout_seconds=hand_config.state_timeout_seconds,
+                live=hand_config.live,
+                print_state=hand_config.print_state,
+                return_to_open=hand_config.return_to_open,
+            )
+        )
+
+    threading.Thread(target=runner, daemon=True).start()
+
+
 def reveal_arm_pose(symbol: str, config: MotionConfig) -> dict[str, float]:
     base_pose = {
         "waist_yaw_joint": -0.12,
@@ -543,6 +672,7 @@ def begin_new_cycle(state: DemoState, now: float) -> None:
     state.symbol = random.choice(GESTURE_OPTIONS)
     state.reveal_pose = build_reveal_pose(state.symbol, state.config.motion)
     state.cycle_started_at = now
+    state.hand_reveal_started = False
     if state.speech_playback is not None:
         state.speech_playback.reset()
     print(f"Next reveal: {state.symbol}")
@@ -588,6 +718,9 @@ def phase_pose(state: DemoState, now: float, elapsed: float) -> dict[str, float]
     if speech_elapsed < shoot_start:
         return countdown_motion(state, speech_elapsed)
     if speech_elapsed < reveal_end:
+        if not state.hand_reveal_started:
+            trigger_hardware_hand_gesture(state)
+            state.hand_reveal_started = True
         reveal_elapsed = speech_elapsed - shoot_start
         return reveal(state, state.symbol, reveal_elapsed)
     if speech_elapsed < hold_end:
@@ -652,12 +785,20 @@ def is_macos_mjpython_requirement(error: Exception) -> bool:
 
 
 def main() -> None:
-    config = DemoConfig()
+    args = parse_args()
+    config = build_demo_config(args)
     state = build_state(config)
     playback = speak_countdown(state)
 
     print("Opening Unitree G1 rock-paper-scissors demo...")
     print("Speech: Rock, paper, scissors, shoot!")
+    if config.hand_hardware.enabled:
+        mode = "live DDS hand control" if config.hand_hardware.live else "dry-run DDS hand control"
+        print(f"Hand bridge: {mode} on {config.hand_hardware.hand} hand")
+        if config.hand_hardware.interface is not None:
+            print(f"DDS interface: {config.hand_hardware.interface}")
+    else:
+        print("Hand bridge: disabled")
     print("Close the MuJoCo window to end the demo.")
 
     try:

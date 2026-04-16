@@ -114,7 +114,9 @@ def _create_dds_session(config: HardwareConfig):
         from .unitree_dds import UnitreeDdsSession
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "Live robot control requires `cyclonedds` in the Nix shell. Re-enter `nix develop` and try again."
+            "Live robot control requires the `cyclonedds` Python package. "
+            "Install it in your active environment, for example "
+            "`python -m pip install cyclonedds`, or use the repo's Nix shell."
         ) from exc
 
     try:
@@ -204,4 +206,3 @@ def _clamp01(value: float) -> float:
 def _format_channels(channels: tuple[float, ...]) -> str:
     pieces = [f"{name}={value:.2f}" for name, value in zip(RIGHT_HAND_CHANNEL_ORDER, channels)]
     return ", ".join(pieces)
-
