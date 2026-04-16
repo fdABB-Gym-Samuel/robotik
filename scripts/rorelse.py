@@ -243,6 +243,7 @@ def neutral_right_arm_pose() -> dict[str, float]:
 
 
 def relaxed_right_hand_pose() -> dict[str, float]:
+    # Idle hand shape when no rock-paper-scissors gesture is being shown.
     return {
         "right_hand_thumb_0_joint": 0.18,
         "right_hand_thumb_1_joint": -0.1,
@@ -289,6 +290,7 @@ def beat_arm_offset(config: MotionConfig, local_time: float, beat_duration: floa
 
 
 def countdown_hand_pose() -> dict[str, float]:
+    # Closed "ready" hand used during the spoken countdown.
     return {
         "right_hand_thumb_0_joint": 0.26,
         "right_hand_thumb_1_joint": -0.08,
@@ -301,6 +303,7 @@ def countdown_hand_pose() -> dict[str, float]:
 
 
 def anticipation_hand_pose() -> dict[str, float]:
+    # Hand pose held just before the final reveal.
     return {
         "right_hand_thumb_0_joint": 0.26,
         "right_hand_thumb_1_joint": -0.08,
@@ -313,6 +316,7 @@ def anticipation_hand_pose() -> dict[str, float]:
 
 
 def final_hand_pose(symbol: str, config: MotionConfig) -> dict[str, float]:
+    # Final revealed hand gestures for rock, paper, and scissors.
     gain = config.finger_open_close_gain
     poses = {
         "rock": {
@@ -434,6 +438,7 @@ def build_ready_pose(config: MotionConfig) -> dict[str, float]:
 
 
 def build_reveal_pose(symbol: str, config: MotionConfig) -> dict[str, float]:
+    # Combines the final arm position with the final hand gesture reveal.
     return add_pose_layers(
         whole_body_stabilization_pose(),
         reveal_arm_pose(symbol, config),
@@ -509,6 +514,7 @@ def countdown_motion(state: DemoState, elapsed: float) -> dict[str, float]:
 
 
 def reveal(state: DemoState, symbol: str, elapsed: float) -> dict[str, float]:
+    # Transitions from the pre-reveal hand shape into the chosen final gesture.
     anticipation_alpha = clamp_unit(elapsed / state.config.timing.anticipation_duration)
     anticipation_pose = add_pose_layers(
         whole_body_stabilization_pose(),
