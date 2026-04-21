@@ -37,7 +37,9 @@ pip install -r requirements.txt
 ```
 
 ### Option B: nix (recommended for the G1 demo)
+
 This option requires the [nix package manager](https://nixos.org/download/)
+
 ```bash
 nix develop
 ```

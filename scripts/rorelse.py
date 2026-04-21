@@ -31,7 +31,9 @@ except ModuleNotFoundError as exc:  # pragma: no cover - import guard for local 
     ) from exc
 
 from scripts.run_g1_rps_hand_hardware import HardwareConfig as HardwareScriptConfig
-from scripts.run_g1_rps_hand_hardware import run_hardware_sequence as run_hand_hardware_sequence
+from scripts.run_g1_rps_hand_hardware import (
+    run_hardware_sequence as run_hand_hardware_sequence,
+)
 
 SCENE_PATH = PROJECT_ROOT / "assets" / "unitree_g1" / "g1_29dof_with_hand.xml"
 LOG_PATH = PROJECT_ROOT / "runs" / "logs" / "rorelse-error.log"
@@ -274,11 +276,14 @@ def clamp_unit(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def blend_pose(start: dict[str, float], target: dict[str, float], alpha: float) -> dict[str, float]:
+def blend_pose(
+    start: dict[str, float], target: dict[str, float], alpha: float
+) -> dict[str, float]:
     alpha = clamp_unit(alpha)
     joint_names = set(start) | set(target)
     return {
-        joint_name: (1.0 - alpha) * start.get(joint_name, 0.0) + alpha * target.get(joint_name, 0.0)
+        joint_name: (1.0 - alpha) * start.get(joint_name, 0.0)
+        + alpha * target.get(joint_name, 0.0)
         for joint_name in joint_names
     }
 
@@ -290,14 +295,18 @@ def add_pose_layers(*layers: dict[str, float]) -> dict[str, float]:
     return pose
 
 
-def add_joint_deltas(base_pose: dict[str, float], deltas: dict[str, float]) -> dict[str, float]:
+def add_joint_deltas(
+    base_pose: dict[str, float], deltas: dict[str, float]
+) -> dict[str, float]:
     updated_pose = dict(base_pose)
     for joint_name, delta in deltas.items():
         updated_pose[joint_name] = updated_pose.get(joint_name, 0.0) + delta
     return updated_pose
 
 
-def set_joint_position(model: mujoco.MjModel, data: mujoco.MjData, joint_name: str, value: float) -> None:
+def set_joint_position(
+    model: mujoco.MjModel, data: mujoco.MjData, joint_name: str, value: float
+) -> None:
     joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
     if joint_id < 0:
         raise ValueError(f"Joint '{joint_name}' was not found in the Unitree G1 model.")
@@ -372,7 +381,9 @@ def play_ready_arm_pose(config: MotionConfig) -> dict[str, float]:
     }
 
 
-def beat_arm_offset(config: MotionConfig, local_time: float, beat_duration: float, beat_index: int) -> dict[str, float]:
+def beat_arm_offset(
+    config: MotionConfig, local_time: float, beat_duration: float, beat_index: int
+) -> dict[str, float]:
     normalized = clamp_unit(local_time / beat_duration)
     downbeat = math.exp(-18.0 * normalized) if normalized > 0.0 else 1.0
     rebound = math.sin(math.pi * normalized)
@@ -540,7 +551,9 @@ def build_countdown_phrase(config: DemoConfig) -> str:
     cues = speech_cues(config)
     pause_ms = max(
         0,
-        int((config.timing.beat_duration - config.speech.estimated_word_duration) * 1000),
+        int(
+            (config.timing.beat_duration - config.speech.estimated_word_duration) * 1000
+        ),
     )
     chunks: list[str] = []
     for index, cue in enumerate(cues):
@@ -575,7 +588,12 @@ def build_reveal_pose(symbol: str, config: MotionConfig) -> dict[str, float]:
     )
 
 
-def apply_pose(model: mujoco.MjModel, data: mujoco.MjData, config: DemoConfig, pose: dict[str, float]) -> None:
+def apply_pose(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    config: DemoConfig,
+    pose: dict[str, float],
+) -> None:
     data.qpos[:] = 0.0
     data.qvel[:] = 0.0
     data.qpos[:7] = [0.0, 0.0, config.motion.base_height, 1.0, 0.0, 0.0, 0.0]
@@ -599,7 +617,8 @@ def speak_countdown(state: DemoState) -> SpeechPlayback:
     playback = SpeechPlayback(
         backend=backend,
         phrase=build_countdown_phrase(state.config),
-        anchor_delay=state.config.speech.startup_latency + state.config.timing.speech_offset,
+        anchor_delay=state.config.speech.startup_latency
+        + state.config.timing.speech_offset,
     )
     state.speech_playback = playback
     return playback
@@ -616,7 +635,9 @@ def countdown_motion(state: DemoState, elapsed: float) -> dict[str, float]:
     )
 
     shoot_time = 3.0 * beat_duration
-    anticipation_start = max(shoot_time - state.config.timing.anticipation_duration, 0.0)
+    anticipation_start = max(
+        shoot_time - state.config.timing.anticipation_duration, 0.0
+    )
     if elapsed >= anticipation_start:
         anticipation_alpha = ease_in_out_cubic(
             (elapsed - anticipation_start) / state.config.timing.anticipation_duration
@@ -636,7 +657,9 @@ def countdown_motion(state: DemoState, elapsed: float) -> dict[str, float]:
         base_pose = blend_pose(base_pose, anticipation_pose, anticipation_alpha)
 
     # Keep the hand loosely engaged during the spoken beats.
-    hand_alpha = 0.45 + 0.15 * math.sin(2.0 * math.pi * clamp_unit(local_time / beat_duration))
+    hand_alpha = 0.45 + 0.15 * math.sin(
+        2.0 * math.pi * clamp_unit(local_time / beat_duration)
+    )
     hand_pose = blend_pose(relaxed_right_hand_pose(), countdown_hand_pose(), hand_alpha)
     base_pose.update(hand_pose)
     return base_pose
@@ -652,10 +675,14 @@ def reveal(state: DemoState, symbol: str, elapsed: float) -> dict[str, float]:
     )
 
     if elapsed <= state.config.timing.anticipation_duration:
-        return blend_pose(state.ready_pose, anticipation_pose, ease_in_out_cubic(anticipation_alpha))
+        return blend_pose(
+            state.ready_pose, anticipation_pose, ease_in_out_cubic(anticipation_alpha)
+        )
 
     reveal_elapsed = elapsed - state.config.timing.anticipation_duration
-    reveal_alpha = ease_in_out_cubic(reveal_elapsed / state.config.timing.reveal_duration)
+    reveal_alpha = ease_in_out_cubic(
+        reveal_elapsed / state.config.timing.reveal_duration
+    )
     return blend_pose(anticipation_pose, state.reveal_pose, reveal_alpha)
 
 
@@ -711,7 +738,11 @@ def phase_pose(state: DemoState, now: float, elapsed: float) -> dict[str, float]
     if state.speech_playback is not None and state.speech_playback.started_at is None:
         state.speech_playback.start(now)
 
-    speech_elapsed = state.speech_playback.elapsed(now) if state.speech_playback is not None else None
+    speech_elapsed = (
+        state.speech_playback.elapsed(now)
+        if state.speech_playback is not None
+        else None
+    )
     if speech_elapsed is None or speech_elapsed < 0.0:
         return dict(state.ready_pose)
 
@@ -764,7 +795,9 @@ def animation_loop(state: DemoState, stop_event: threading.Event) -> None:
 def launch_blocking_fallback(state: DemoState, playback: SpeechPlayback) -> None:
     print("Passive viewer failed. Falling back to blocking viewer.")
     stop_event = threading.Event()
-    thread = threading.Thread(target=animation_loop, args=(state, stop_event), daemon=True)
+    thread = threading.Thread(
+        target=animation_loop, args=(state, stop_event), daemon=True
+    )
     thread.start()
     try:
         mujoco.viewer._launch_internal(  # type: ignore[attr-defined]
@@ -793,7 +826,11 @@ def main() -> None:
     print("Opening Unitree G1 rock-paper-scissors demo...")
     print("Speech: Rock, paper, scissors, shoot!")
     if config.hand_hardware.enabled:
-        mode = "live DDS hand control" if config.hand_hardware.live else "dry-run DDS hand control"
+        mode = (
+            "live DDS hand control"
+            if config.hand_hardware.live
+            else "dry-run DDS hand control"
+        )
         print(f"Hand bridge: {mode} on {config.hand_hardware.hand} hand")
         if config.hand_hardware.interface is not None:
             print(f"DDS interface: {config.hand_hardware.interface}")
@@ -825,7 +862,9 @@ def main() -> None:
         LOG_PATH.write_text(error_trace)
         if is_macos_mjpython_requirement(error):
             print("Passive viewer is unavailable under plain `python` on macOS.")
-            print("For the passive viewer, run: source .venv/bin/activate && mjpython scripts/rorelse.py")
+            print(
+                "For the passive viewer, run: source .venv/bin/activate && mjpython scripts/rorelse.py"
+            )
             launch_blocking_fallback(state, playback)
             return
         if sys.platform == "darwin":

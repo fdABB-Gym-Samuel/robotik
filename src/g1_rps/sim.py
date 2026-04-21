@@ -12,7 +12,9 @@ from .poses import DEFAULT_SEQUENCE, POSED_JOINTS, DemoConfig, build_hand_pose
 def run_demo(config: DemoConfig) -> None:
     mujoco, viewer = _import_mujoco()
 
-    model_path = ensure_unitree_g1_assets(Path(config.asset_dir) if config.asset_dir else None)
+    model_path = ensure_unitree_g1_assets(
+        Path(config.asset_dir) if config.asset_dir else None
+    )
     model = mujoco.MjModel.from_xml_path(str(model_path))
     data = mujoco.MjData(model)
 
@@ -35,7 +37,9 @@ def run_demo(config: DemoConfig) -> None:
     focus_body_name = "right_base_link"
     focus_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, focus_body_name)
     if focus_body_id < 0:
-        raise RuntimeError(f"Body '{focus_body_name}' was not found in the Inspire hand model.")
+        raise RuntimeError(
+            f"Body '{focus_body_name}' was not found in the Inspire hand model."
+        )
 
     print(
         "Launching exact Unitree Inspire hand demo with gesture sequence: "
@@ -43,7 +47,9 @@ def run_demo(config: DemoConfig) -> None:
     )
     print(f"Using official asset: {model_path}")
 
-    with viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False) as handle:
+    with viewer.launch_passive(
+        model, data, show_left_ui=False, show_right_ui=False
+    ) as handle:
         _configure_camera(handle, data, focus_body_id, config.camera_preset)
 
         phase = "hold"
@@ -67,7 +73,9 @@ def run_demo(config: DemoConfig) -> None:
                 if alpha >= 1.0:
                     current_index = (current_index + 1) % len(gesture_sequence)
                     current_gesture = gesture_sequence[current_index]
-                    next_gesture = gesture_sequence[(current_index + 1) % len(gesture_sequence)]
+                    next_gesture = gesture_sequence[
+                        (current_index + 1) % len(gesture_sequence)
+                    ]
                     start_pose = end_pose
                     end_pose = build_hand_pose(next_gesture, joint_ranges)
                     phase = "hold"
@@ -109,10 +117,13 @@ def _collect_joint_ranges(mujoco, model) -> dict[str, tuple[float, float]]:
 
 
 def _validate_required_joints(joint_ranges: dict[str, tuple[float, float]]) -> None:
-    missing = [joint_name for joint_name in POSED_JOINTS if joint_name not in joint_ranges]
+    missing = [
+        joint_name for joint_name in POSED_JOINTS if joint_name not in joint_ranges
+    ]
     if missing:
         raise RuntimeError(
-            "The official Inspire hand asset is missing expected joints: " + ", ".join(missing)
+            "The official Inspire hand asset is missing expected joints: "
+            + ", ".join(missing)
         )
 
 

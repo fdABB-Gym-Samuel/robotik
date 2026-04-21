@@ -109,7 +109,9 @@ class UnitreeDdsSession:
     ) -> None:
         config = CHANNEL_CONFIG_AUTODETERMINE
         if network_interface:
-            config = CHANNEL_CONFIG_HAS_INTERFACE.replace("$__IF_NAME__$", network_interface)
+            config = CHANNEL_CONFIG_HAS_INTERFACE.replace(
+                "$__IF_NAME__$", network_interface
+            )
 
         self._domain = Domain(domain_id, config)
         self._participant = DomainParticipant(domain_id)
@@ -129,4 +131,6 @@ class UnitreeDdsSession:
         except TimeoutError:
             return None
         except DDSException as exc:
-            raise RuntimeError(f"Failed to read Inspire hand state over DDS: {exc.msg}") from exc
+            raise RuntimeError(
+                f"Failed to read Inspire hand state over DDS: {exc.msg}"
+            ) from exc

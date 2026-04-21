@@ -33,14 +33,13 @@ LOG_PATH = PROJECT_ROOT / "runs" / "logs" / "pre-reveal-error.log"
 class JointInterface(Protocol):
     """Generic robot-style interface for joint-space control."""
 
-    def set_joint_position(self, joint_name: str, angle: float, time_sec: float) -> None:
-        ...
+    def set_joint_position(
+        self, joint_name: str, angle: float, time_sec: float
+    ) -> None: ...
 
-    def move_joints(self, joint_targets: dict[str, float], time_sec: float) -> None:
-        ...
+    def move_joints(self, joint_targets: dict[str, float], time_sec: float) -> None: ...
 
-    def sleep(self, time_sec: float) -> None:
-        ...
+    def sleep(self, time_sec: float) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -118,7 +117,9 @@ def pumping_pose(params: MotionParameters, cycle_phase: float) -> dict[str, floa
     # Smooth periodic trajectory: cosine keeps turnarounds gentle.
     cosine = math.cos(2.0 * math.pi * cycle_phase)
 
-    shoulder_pitch = params.shoulder_pitch_baseline + params.shoulder_pitch_amplitude * cosine
+    shoulder_pitch = (
+        params.shoulder_pitch_baseline + params.shoulder_pitch_amplitude * cosine
+    )
     elbow_flex = params.elbow_flex_baseline - params.elbow_flex_amplitude * cosine
 
     # Small shoulder compensation keeps the hand path nearly vertical.
@@ -151,20 +152,36 @@ def joint_motion_table(params: MotionParameters) -> str:
     rows = [
         ("waist_yaw_joint", f"{params.waist_yaw:+.2f}", "stable torso alignment"),
         ("waist_roll_joint", f"{params.waist_roll:+.2f}", "upright torso"),
-        ("waist_pitch_joint", f"{params.waist_pitch:+.2f}", "small forward presentation"),
+        (
+            "waist_pitch_joint",
+            f"{params.waist_pitch:+.2f}",
+            "small forward presentation",
+        ),
         (
             "right_shoulder_pitch_joint",
             f"{params.shoulder_pitch_baseline:+.2f} +/- {params.shoulder_pitch_amplitude:.2f}",
             "small cyclic compensation arc",
         ),
-        ("right_shoulder_roll_joint", f"{params.shoulder_roll:+.2f}", "holds arm in front of torso"),
-        ("right_shoulder_yaw_joint", f"{params.shoulder_yaw:+.2f} +/- 0.02", "tiny fore-aft arc"),
+        (
+            "right_shoulder_roll_joint",
+            f"{params.shoulder_roll:+.2f}",
+            "holds arm in front of torso",
+        ),
+        (
+            "right_shoulder_yaw_joint",
+            f"{params.shoulder_yaw:+.2f} +/- 0.02",
+            "tiny fore-aft arc",
+        ),
         (
             "right_elbow_joint",
             f"{params.elbow_flex_baseline:+.2f} +/- {params.elbow_flex_amplitude:.2f}",
             "primary pumping driver",
         ),
-        ("right_wrist_roll_joint", f"{params.forearm_rotation:+.2f}", "near-neutral pronation"),
+        (
+            "right_wrist_roll_joint",
+            f"{params.forearm_rotation:+.2f}",
+            "near-neutral pronation",
+        ),
         ("right_wrist_pitch_joint", f"{params.wrist_pitch:+.2f}", "quiet wrist"),
         ("right_wrist_yaw_joint", f"{params.wrist_yaw:+.2f}", "quiet wrist"),
         ("right_hand_*", f"{params.finger_flex:+.2f}", "concealed neutral pre-shape"),
@@ -186,7 +203,9 @@ class SimulatorArmInterface(JointInterface):
     def _joint_id(self, joint_name: str) -> int:
         joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
         if joint_id < 0:
-            raise ValueError(f"Joint '{joint_name}' was not found in the Unitree G1 model.")
+            raise ValueError(
+                f"Joint '{joint_name}' was not found in the Unitree G1 model."
+            )
         return joint_id
 
     def clamp_to_limits(self, joint_name: str, angle: float) -> float:
@@ -196,7 +215,9 @@ class SimulatorArmInterface(JointInterface):
             return max(float(low), min(float(high), angle))
         return angle
 
-    def set_joint_position(self, joint_name: str, angle: float, time_sec: float) -> None:
+    def set_joint_position(
+        self, joint_name: str, angle: float, time_sec: float
+    ) -> None:
         self.move_joints({joint_name: angle}, time_sec)
 
     def _apply_targets(self, joint_targets: dict[str, float]) -> None:
@@ -226,7 +247,8 @@ class SimulatorArmInterface(JointInterface):
             eased = 0.5 - 0.5 * math.cos(math.pi * alpha)
             interpolated = {
                 joint_name: start_targets.get(joint_name, 0.0)
-                + (merged_targets[joint_name] - start_targets.get(joint_name, 0.0)) * eased
+                + (merged_targets[joint_name] - start_targets.get(joint_name, 0.0))
+                * eased
                 for joint_name in merged_targets
             }
             self._apply_targets(interpolated)
@@ -247,7 +269,9 @@ class SimulatorArmInterface(JointInterface):
         except Exception as error:
             LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             LOG_PATH.write_text(traceback.format_exc())
-            if sys.platform == "darwin" and "run under `mjpython` on macOS" in str(error):
+            if sys.platform == "darwin" and "run under `mjpython` on macOS" in str(
+                error
+            ):
                 print("Passive viewer is unavailable under plain `python` on macOS.")
                 print(
                     "For the passive viewer, run: source .venv/bin/activate && "
@@ -294,7 +318,9 @@ def main() -> None:
     print(joint_motion_table(params))
 
     simulator = SimulatorArmInterface(SCENE_PATH, params.control_dt)
-    simulator.launch_viewer_with_motion(lambda: run_pre_reveal_motion(simulator, params))
+    simulator.launch_viewer_with_motion(
+        lambda: run_pre_reveal_motion(simulator, params)
+    )
 
 
 if __name__ == "__main__":

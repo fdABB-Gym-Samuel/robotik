@@ -11,7 +11,12 @@ import numpy as np
 from gymnasium import spaces
 
 
-DEFAULT_XML_PATH = Path(__file__).resolve().parents[1] / "assets" / "unitree_g1" / "g1_29dof_with_hand.xml"
+DEFAULT_XML_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "assets"
+    / "unitree_g1"
+    / "g1_29dof_with_hand.xml"
+)
 
 
 class UnitreeG1Env(gym.Env[np.ndarray, np.ndarray]):
@@ -40,7 +45,9 @@ class UnitreeG1Env(gym.Env[np.ndarray, np.ndarray]):
 
         ctrlrange = np.asarray(self.model.actuator_ctrlrange, dtype=np.float32)
         if ctrlrange.size == 0:
-            raise ValueError("The Unitree G1 model has no actuators, so no action space can be built.")
+            raise ValueError(
+                "The Unitree G1 model has no actuators, so no action space can be built."
+            )
 
         self.action_space = spaces.Box(
             low=ctrlrange[:, 0],
@@ -61,7 +68,9 @@ class UnitreeG1Env(gym.Env[np.ndarray, np.ndarray]):
         self._initial_qvel = self.data.qvel.copy()
 
     def _get_obs(self) -> np.ndarray:
-        return np.concatenate([self.data.qpos, self.data.qvel]).astype(np.float64, copy=False)
+        return np.concatenate([self.data.qpos, self.data.qvel]).astype(
+            np.float64, copy=False
+        )
 
     def _torso_height(self) -> float:
         if self.model.nbody > 1:
@@ -69,7 +78,10 @@ class UnitreeG1Env(gym.Env[np.ndarray, np.ndarray]):
         return float(self.data.qpos[2]) if self.model.nq > 2 else 0.0
 
     def _is_unhealthy(self) -> bool:
-        return bool(not np.isfinite(self.data.qpos).all() or not np.isfinite(self.data.qvel).all())
+        return bool(
+            not np.isfinite(self.data.qpos).all()
+            or not np.isfinite(self.data.qvel).all()
+        )
 
     def _ensure_viewer(self) -> None:
         if self.render_mode != "human" or self._viewer is not None:
@@ -105,7 +117,9 @@ class UnitreeG1Env(gym.Env[np.ndarray, np.ndarray]):
 
         return self._get_obs(), {"xml_path": str(self.xml_path)}
 
-    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, float]]:
+    def step(
+        self, action: np.ndarray
+    ) -> tuple[np.ndarray, float, bool, bool, dict[str, float]]:
         action = np.asarray(action, dtype=np.float32)
         clipped_action = np.clip(action, self.action_space.low, self.action_space.high)
 
@@ -115,7 +129,9 @@ class UnitreeG1Env(gym.Env[np.ndarray, np.ndarray]):
             mujoco.mj_step(self.model, self.data)
         x_after = float(self.data.qpos[0]) if self.model.nq > 0 else 0.0
 
-        forward_reward = (x_after - x_before) / (self.model.opt.timestep * self.frame_skip)
+        forward_reward = (x_after - x_before) / (
+            self.model.opt.timestep * self.frame_skip
+        )
         control_cost = 0.001 * float(np.square(clipped_action).sum())
         height_penalty = 1.0 if self._torso_height() < 0.45 else 0.0
         reward = forward_reward - control_cost - height_penalty
@@ -126,11 +142,17 @@ class UnitreeG1Env(gym.Env[np.ndarray, np.ndarray]):
             if self._viewer is not None:
                 self._viewer.sync()
 
-        return self._get_obs(), reward, terminated, False, {
-            "forward_reward": forward_reward,
-            "control_cost": control_cost,
-            "torso_height": self._torso_height(),
-        }
+        return (
+            self._get_obs(),
+            reward,
+            terminated,
+            False,
+            {
+                "forward_reward": forward_reward,
+                "control_cost": control_cost,
+                "torso_height": self._torso_height(),
+            },
+        )
 
     def render(self) -> None:
         if self.render_mode == "human":
