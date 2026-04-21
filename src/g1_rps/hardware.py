@@ -37,6 +37,7 @@ class HardwareConfig:
     live: bool = False
     print_state: bool = False
     return_to_open: bool = True
+    allow_state_fallback: bool = False
 
 
 def build_hardware_channels(gesture: str) -> tuple[float, float, float, float, float, float]:
@@ -80,6 +81,11 @@ def run_hardware_sequence(config: HardwareConfig) -> None:
     sequence = tuple(config.sequence or DEFAULT_SEQUENCE)
     if not sequence:
         raise RuntimeError("The hardware gesture sequence cannot be empty.")
+    if config.hand != "right":
+        raise RuntimeError(
+            "Left-hand hardware control is not enabled yet. "
+            "The current gesture mapping is calibrated only for the right Inspire hand."
+        )
 
     print(f"Active hand: {config.hand}")
     print(f"Gesture sequence: {', '.join(sequence)}")
@@ -90,7 +96,10 @@ def run_hardware_sequence(config: HardwareConfig) -> None:
         return
 
     session = _create_dds_session(config)
-    current = _initial_channels_from_state(session, config) or build_hardware_channels("paper")
+    initial_state = _require_initial_state(session, config)
+    current = extract_hand_channels_from_state(initial_state, config.hand)
+    inactive_hand = "left" if config.hand == "right" else "right"
+    inactive_channels = extract_hand_channels_from_state(initial_state, inactive_hand)
 
     if config.print_state:
         print("Initial state:", _format_channels(current))
@@ -98,15 +107,15 @@ def run_hardware_sequence(config: HardwareConfig) -> None:
     for gesture in sequence:
         target = build_hardware_channels(gesture)
         print(f"Commanding gesture: {gesture} -> {_format_channels(target)}")
-        _interpolate_and_publish(session, current, target, config)
+        _interpolate_and_publish(session, current, target, inactive_channels, config)
         current = target
-        _hold_target(session, target, config)
+        _hold_target(session, target, inactive_channels, config)
 
     if config.return_to_open:
         target = build_hardware_channels("paper")
         print(f"Returning to open pose -> {_format_channels(target)}")
-        _interpolate_and_publish(session, current, target, config)
-        _hold_target(session, target, config)
+        _interpolate_and_publish(session, current, target, inactive_channels, config)
+        _hold_target(session, target, inactive_channels, config)
 
 
 def _create_dds_session(config: HardwareConfig):
@@ -137,7 +146,21 @@ def _initial_channels_from_state(session, config: HardwareConfig) -> tuple[float
     state = session.read_state(timeout_seconds=config.state_timeout_seconds)
     if state is None or len(state.states) < 12:
         return None
-    return extract_hand_channels_from_state(state, config.hand)
+    return state
+
+
+def _require_initial_state(session, config: HardwareConfig):
+    state = _initial_channels_from_state(session, config)
+    if state is not None:
+        return state
+    if config.allow_state_fallback:
+        print("Warning: no initial Inspire hand state received, falling back to a synthetic open-state baseline.")
+        return _synthetic_open_state()
+    raise RuntimeError(
+        "No valid initial Inspire hand state was received. "
+        "Refusing to send live commands from a guessed starting pose. "
+        "Check the DDS connection, the network interface, and whether the robot-side Inspire hand service is running."
+    )
 
 
 def extract_hand_channels_from_state(state, hand: str) -> tuple[float, float, float, float, float, float]:
@@ -145,22 +168,33 @@ def extract_hand_channels_from_state(state, hand: str) -> tuple[float, float, fl
     return tuple(_clamp01(float(state.states[offset + index].q)) for index in range(6))
 
 
-def _interpolate_and_publish(session, start: tuple[float, ...], end: tuple[float, ...], config: HardwareConfig) -> None:
+def _interpolate_and_publish(
+    session,
+    start: tuple[float, ...],
+    end: tuple[float, ...],
+    inactive_channels: tuple[float, ...],
+    config: HardwareConfig,
+) -> None:
     steps = max(1, int(round(config.transition_seconds * config.rate_hz)))
     sleep_seconds = 1.0 / config.rate_hz
     for step in range(1, steps + 1):
         alpha = step / steps
         sample = tuple((1.0 - alpha) * start[i] + alpha * end[i] for i in range(6))
-        session.write(build_motor_commands(sample, config.hand))
+        session.write(build_motor_commands(sample, config.hand, inactive_channels))
         if config.print_state:
             print("  sent:", _format_channels(sample))
         time.sleep(sleep_seconds)
 
 
-def _hold_target(session, target: tuple[float, ...], config: HardwareConfig) -> None:
+def _hold_target(
+    session,
+    target: tuple[float, ...],
+    inactive_channels: tuple[float, ...],
+    config: HardwareConfig,
+) -> None:
     steps = max(1, int(round(config.hold_seconds * config.rate_hz)))
     sleep_seconds = 1.0 / config.rate_hz
-    sample = build_motor_commands(target, config.hand)
+    sample = build_motor_commands(target, config.hand, inactive_channels)
     for _ in range(steps):
         session.write(sample)
         if config.print_state:
@@ -173,6 +207,7 @@ def _hold_target(session, target: tuple[float, ...], config: HardwareConfig) -> 
 def build_motor_commands(
     active_channels: tuple[float, float, float, float, float, float],
     hand: str,
+    inactive_channels: tuple[float, float, float, float, float, float],
 ) -> "MotorCmds_":
     from .unitree_dds import MotorCmd_, MotorCmds_
 
@@ -183,8 +218,8 @@ def build_motor_commands(
     for index, value in enumerate(active_channels):
         commands[active_offset + index].q = _clamp01(value)
 
-    for index in range(6):
-        commands[inactive_offset + index].q = 1.0
+    for index, value in enumerate(inactive_channels):
+        commands[inactive_offset + index].q = _clamp01(value)
 
     return MotorCmds_(cmds=commands)
 
@@ -201,6 +236,12 @@ def _invert_average(*values: float) -> float:
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
+
+
+def _synthetic_open_state():
+    from .unitree_dds import MotorState_, MotorStates_
+
+    return MotorStates_(states=[MotorState_(q=1.0) for _ in range(12)])
 
 
 def _format_channels(channels: tuple[float, ...]) -> str:

@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import traceback
+from xml.etree import ElementTree
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -20,13 +21,22 @@ try:
     import mujoco.viewer
 except ModuleNotFoundError as exc:  # pragma: no cover - local setup guard
     raise SystemExit(
-        "MuJoCo Python bindings are not installed. Activate .venv and install "
-        "requirements before running this script."
+        "MuJoCo Python bindings are not installed. Enter `nix develop` first "
+        "before running this script."
+    ) from exc
+
+try:
+    import trimesh
+except ModuleNotFoundError as exc:  # pragma: no cover - local setup guard
+    raise SystemExit(
+        "The `trimesh` package is required to build the runtime-safe Unitree G1 scene. "
+        "Enter `nix develop` first."
     ) from exc
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCENE_PATH = PROJECT_ROOT / "assets" / "unitree_g1" / "g1_29dof_with_hand.xml"
+RUNTIME_SCENE_PATH = PROJECT_ROOT / "runs" / "assets" / "unitree_g1" / "g1_29dof_with_hand_runtime.xml"
 LOG_PATH = PROJECT_ROOT / "runs" / "logs" / "pre-reveal-error.log"
 
 
@@ -178,7 +188,8 @@ class SimulatorArmInterface(JointInterface):
     def __init__(self, xml_path: Path, control_dt: float) -> None:
         if not xml_path.exists():
             raise SystemExit(f"Unitree G1 scene not found: {xml_path}")
-        self.model = mujoco.MjModel.from_xml_path(str(xml_path))
+        runtime_scene = ensure_runtime_scene(xml_path)
+        self.model = mujoco.MjModel.from_xml_path(str(runtime_scene))
         self.data = mujoco.MjData(self.model)
         self.control_dt = control_dt
         self.current_targets = setup_pose(MotionParameters())
@@ -250,8 +261,7 @@ class SimulatorArmInterface(JointInterface):
             if sys.platform == "darwin" and "run under `mjpython` on macOS" in str(error):
                 print("Passive viewer is unavailable under plain `python` on macOS.")
                 print(
-                    "For the passive viewer, run: source .venv/bin/activate && "
-                    "mjpython scripts/pre_reveal_right_arm.py"
+                    "For the passive viewer, run: nix develop -c mjpython scripts/pre_reveal_right_arm.py"
                 )
             else:
                 print(f"Passive viewer failed. Details saved to {LOG_PATH}")
@@ -280,6 +290,56 @@ def run_pre_reveal_motion(robot: JointInterface, params: MotionParameters) -> No
             robot.move_joints(pumping_pose(params, cycle_phase), params.control_dt)
 
     robot.move_joints(neutral_stop_pose(params), params.stop_duration)
+
+
+def ensure_runtime_scene(scene_path: Path) -> Path:
+    runtime_path = RUNTIME_SCENE_PATH
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tree = ElementTree.parse(scene_path)
+    root = tree.getroot()
+    compiler = root.find("compiler")
+    meshdir = compiler.get("meshdir", "") if compiler is not None else ""
+    base_mesh_dir = (scene_path.parent / meshdir).resolve()
+
+    asset = root.find("asset")
+    if asset is None:
+        raise SystemExit(f"Scene does not contain an <asset> section: {scene_path}")
+
+    source_mtimes = [scene_path.stat().st_mtime]
+    for mesh in asset.findall("mesh"):
+        mesh_file = mesh.get("file")
+        if not mesh_file:
+            continue
+        mesh_path = (base_mesh_dir / mesh_file).resolve()
+        if mesh_path.exists():
+            source_mtimes.append(mesh_path.stat().st_mtime)
+
+    if runtime_path.exists() and runtime_path.stat().st_mtime >= max(source_mtimes):
+        return runtime_path
+
+    for mesh in asset.findall("mesh"):
+        mesh_file = mesh.get("file")
+        if not mesh_file:
+            continue
+        mesh_path = (base_mesh_dir / mesh_file).resolve()
+        loaded = trimesh.load_mesh(mesh_path, force="mesh")
+        if isinstance(loaded, trimesh.Scene):
+            loaded = trimesh.util.concatenate(tuple(loaded.geometry.values()))
+        mesh.attrib.pop("file", None)
+        mesh.set("vertex", _flatten_rows(loaded.vertices))
+        mesh.set("face", _flatten_rows(loaded.faces))
+
+    if compiler is not None and "meshdir" in compiler.attrib:
+        compiler.attrib.pop("meshdir", None)
+
+    ElementTree.indent(tree, space="  ")
+    tree.write(runtime_path, encoding="utf-8", xml_declaration=False)
+    return runtime_path
+
+
+def _flatten_rows(rows) -> str:
+    return " ".join(" ".join(f"{value:.9g}" for value in row) for row in rows)
 
 
 def main() -> None:

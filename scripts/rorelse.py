@@ -11,8 +11,10 @@ import sys
 import threading
 import traceback
 import time
+from xml.etree import ElementTree
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -21,20 +23,16 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
     if candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
 
-try:
+if TYPE_CHECKING:
     import mujoco
-    import mujoco.viewer
-except ModuleNotFoundError as exc:  # pragma: no cover - import guard for local setup
-    raise SystemExit(
-        "MuJoCo Python bindings are not installed. Run `pip install -r requirements.txt` "
-        "before starting the Unitree G1 viewer."
-    ) from exc
 
+from g1_rps.arm_hardware import ArmHardwareConfig, run_pre_reveal_right_arm_hardware
 from scripts.run_g1_rps_hand_hardware import HardwareConfig as HardwareScriptConfig
 from scripts.run_g1_rps_hand_hardware import run_hardware_sequence as run_hand_hardware_sequence
 
 SCENE_PATH = PROJECT_ROOT / "assets" / "unitree_g1" / "g1_29dof_with_hand.xml"
 LOG_PATH = PROJECT_ROOT / "runs" / "logs" / "rorelse-error.log"
+RUNTIME_SCENE_PATH = PROJECT_ROOT / "runs" / "assets" / "unitree_g1" / "g1_29dof_with_hand_runtime.xml"
 FRAME_DT = 1.0 / 60.0
 GESTURE_OPTIONS = ("rock", "paper", "scissors")
 
@@ -82,6 +80,7 @@ class HandBridgeConfig:
     state_timeout_seconds: float = 1.0
     print_state: bool = False
     return_to_open: bool = False
+    allow_state_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -102,8 +101,8 @@ class SpeechCue:
 
 @dataclass
 class DemoState:
-    model: mujoco.MjModel
-    data: mujoco.MjData
+    model: "mujoco.MjModel"
+    data: "mujoco.MjData"
     config: DemoConfig
     symbol: str
     idle_pose: dict[str, float]
@@ -196,6 +195,16 @@ def parse_args() -> argparse.Namespace:
         help="Publish the reveal gesture to the real Inspire hand over DDS.",
     )
     parser.add_argument(
+        "--real-hand-only",
+        action="store_true",
+        help="Skip MuJoCo and send the reveal gesture only to the physical Inspire hand.",
+    )
+    parser.add_argument(
+        "--real-arm-only",
+        action="store_true",
+        help="Skip MuJoCo and run only the rhythmic pre-reveal motion on the physical G1 right arm.",
+    )
+    parser.add_argument(
         "--disable-hand",
         action="store_true",
         help="Disable the imported hardware-hand trigger entirely.",
@@ -217,10 +226,15 @@ def parse_args() -> argparse.Namespace:
         help="Print outgoing hand commands and any received Inspire hand state.",
     )
     parser.add_argument(
+        "--print-arm-state",
+        action="store_true",
+        help="Print the initial right-arm `rt/lowstate` sample in --real-arm-only mode.",
+    )
+    parser.add_argument(
         "--hand",
-        choices=("right", "left"),
+        choices=("right",),
         default="right",
-        help="Which physical Inspire hand to command.",
+        help="Which physical Inspire hand to command. Only the right hand is calibrated.",
     )
     parser.add_argument(
         "--hand-transition-seconds",
@@ -239,6 +253,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Return the real hand to the open paper pose after each reveal.",
     )
+    parser.add_argument(
+        "--live-arm",
+        action="store_true",
+        help="Actually publish `rt/arm_sdk` commands in --real-arm-only mode.",
+    )
+    parser.add_argument(
+        "--allow-state-fallback",
+        action="store_true",
+        help="Allow a less safe synthetic open-state fallback if no initial hand state is received.",
+    )
+    parser.add_argument(
+        "--symbol",
+        choices=GESTURE_OPTIONS,
+        default=None,
+        help="Gesture to reveal in --real-hand-only mode. Defaults to a random choice.",
+    )
     return parser.parse_args()
 
 
@@ -253,6 +283,7 @@ def build_demo_config(args: argparse.Namespace) -> DemoConfig:
         interface=args.interface,
         print_state=args.print_hand_state,
         return_to_open=args.return_hand_to_open,
+        allow_state_fallback=args.allow_state_fallback,
     )
     return DemoConfig(hand_hardware=hand_hardware)
 
@@ -261,6 +292,28 @@ def choose_speech_backend(config: SpeechConfig) -> SpeechBackend:
     if shutil.which("say"):
         return MacSayBackend(config)
     return PrintSpeechBackend()
+
+
+def import_mujoco():
+    try:
+        import mujoco
+        import mujoco.viewer
+    except ModuleNotFoundError as exc:  # pragma: no cover - import guard for local setup
+        raise SystemExit(
+            "MuJoCo Python bindings are not installed. Enter `nix develop` first before running viewer mode."
+        ) from exc
+    return mujoco
+
+
+def import_trimesh():
+    try:
+        import trimesh
+    except ModuleNotFoundError as exc:  # pragma: no cover - import guard for local setup
+        raise SystemExit(
+            "The `trimesh` package is required to build the runtime-safe Unitree G1 scene. "
+            "Enter `nix develop` first."
+        ) from exc
+    return trimesh
 
 
 def ease_in_out_cubic(alpha: float) -> float:
@@ -298,6 +351,7 @@ def add_joint_deltas(base_pose: dict[str, float], deltas: dict[str, float]) -> d
 
 
 def set_joint_position(model: mujoco.MjModel, data: mujoco.MjData, joint_name: str, value: float) -> None:
+    mujoco = import_mujoco()
     joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
     if joint_id < 0:
         raise ValueError(f"Joint '{joint_name}' was not found in the Unitree G1 model.")
@@ -458,23 +512,29 @@ def trigger_hardware_hand_gesture(state: DemoState) -> None:
         return
 
     def runner() -> None:
-        run_hand_hardware_sequence(
-            HardwareScriptConfig(
-                sequence=(state.symbol,),
-                transition_seconds=hand_config.transition_seconds,
-                hold_seconds=hand_config.hold_seconds,
-                rate_hz=hand_config.rate_hz,
-                hand=hand_config.hand,
-                domain_id=hand_config.domain_id,
-                network_interface=hand_config.interface,
-                command_topic=hand_config.command_topic,
-                state_topic=hand_config.state_topic,
-                state_timeout_seconds=hand_config.state_timeout_seconds,
-                live=hand_config.live,
-                print_state=hand_config.print_state,
-                return_to_open=hand_config.return_to_open,
+        try:
+            run_hand_hardware_sequence(
+                HardwareScriptConfig(
+                    sequence=(state.symbol,),
+                    transition_seconds=hand_config.transition_seconds,
+                    hold_seconds=hand_config.hold_seconds,
+                    rate_hz=hand_config.rate_hz,
+                    hand=hand_config.hand,
+                    domain_id=hand_config.domain_id,
+                    network_interface=hand_config.interface,
+                    command_topic=hand_config.command_topic,
+                    state_topic=hand_config.state_topic,
+                    state_timeout_seconds=hand_config.state_timeout_seconds,
+                    allow_state_fallback=hand_config.allow_state_fallback,
+                    live=hand_config.live,
+                    print_state=hand_config.print_state,
+                    return_to_open=hand_config.return_to_open,
+                )
             )
-        )
+        except Exception as exc:
+            print(f"Hardware hand trigger failed: {exc}")
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LOG_PATH.write_text(traceback.format_exc(), encoding="utf-8")
 
     threading.Thread(target=runner, daemon=True).start()
 
@@ -576,6 +636,7 @@ def build_reveal_pose(symbol: str, config: MotionConfig) -> dict[str, float]:
 
 
 def apply_pose(model: mujoco.MjModel, data: mujoco.MjData, config: DemoConfig, pose: dict[str, float]) -> None:
+    mujoco = import_mujoco()
     data.qpos[:] = 0.0
     data.qvel[:] = 0.0
     data.qpos[:7] = [0.0, 0.0, config.motion.base_height, 1.0, 0.0, 0.0, 0.0]
@@ -679,10 +740,12 @@ def begin_new_cycle(state: DemoState, now: float) -> None:
 
 
 def build_state(config: DemoConfig) -> DemoState:
+    mujoco = import_mujoco()
     if not config.scene_path.exists():
         raise SystemExit(f"Unitree G1 scene not found: {config.scene_path}")
 
-    model = mujoco.MjModel.from_xml_path(str(config.scene_path))
+    model_path = ensure_runtime_scene(config.scene_path)
+    model = mujoco.MjModel.from_xml_path(str(model_path))
     data = mujoco.MjData(model)
     initial_symbol = random.choice(GESTURE_OPTIONS)
     state = DemoState(
@@ -695,6 +758,59 @@ def build_state(config: DemoConfig) -> DemoState:
         reveal_pose=build_reveal_pose(initial_symbol, config.motion),
     )
     return state
+
+
+def ensure_runtime_scene(scene_path: Path) -> Path:
+    trimesh = import_trimesh()
+    runtime_path = RUNTIME_SCENE_PATH
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tree = ElementTree.parse(scene_path)
+    root = tree.getroot()
+    compiler = root.find("compiler")
+    meshdir = compiler.get("meshdir", "") if compiler is not None else ""
+    base_mesh_dir = (scene_path.parent / meshdir).resolve()
+
+    asset = root.find("asset")
+    if asset is None:
+        raise SystemExit(f"Scene does not contain an <asset> section: {scene_path}")
+
+    source_mtimes = [scene_path.stat().st_mtime]
+    for mesh in asset.findall("mesh"):
+        mesh_file = mesh.get("file")
+        if not mesh_file:
+            continue
+        mesh_path = (base_mesh_dir / mesh_file).resolve()
+        if mesh_path.exists():
+            source_mtimes.append(mesh_path.stat().st_mtime)
+
+    if runtime_path.exists() and runtime_path.stat().st_mtime >= max(source_mtimes):
+        return runtime_path
+
+    for mesh in asset.findall("mesh"):
+        mesh_file = mesh.get("file")
+        if not mesh_file:
+            continue
+        mesh_path = (base_mesh_dir / mesh_file).resolve()
+        loaded = trimesh.load_mesh(mesh_path, force="mesh")
+        if isinstance(loaded, trimesh.Scene):
+            loaded = trimesh.util.concatenate(tuple(loaded.geometry.values()))
+        vertices = loaded.vertices
+        faces = loaded.faces
+        mesh.attrib.pop("file", None)
+        mesh.set("vertex", _flatten_rows(vertices))
+        mesh.set("face", _flatten_rows(faces))
+
+    if compiler is not None and "meshdir" in compiler.attrib:
+        compiler.attrib.pop("meshdir", None)
+
+    ElementTree.indent(tree, space="  ")
+    tree.write(runtime_path, encoding="utf-8", xml_declaration=False)
+    return runtime_path
+
+
+def _flatten_rows(rows) -> str:
+    return " ".join(" ".join(f"{value:.9g}" for value in row) for row in rows)
 
 
 def phase_pose(state: DemoState, now: float, elapsed: float) -> dict[str, float]:
@@ -762,6 +878,7 @@ def animation_loop(state: DemoState, stop_event: threading.Event) -> None:
 
 
 def launch_blocking_fallback(state: DemoState, playback: SpeechPlayback) -> None:
+    mujoco = import_mujoco()
     print("Passive viewer failed. Falling back to blocking viewer.")
     stop_event = threading.Event()
     thread = threading.Thread(target=animation_loop, args=(state, stop_event), daemon=True)
@@ -787,6 +904,53 @@ def is_macos_mjpython_requirement(error: Exception) -> bool:
 def main() -> None:
     args = parse_args()
     config = build_demo_config(args)
+    if args.real_arm_only:
+        print("Running physical G1 right arm only.")
+        print("Motion: rhythmic pre-reveal rocking from the concealed ready pose")
+        if args.interface is not None:
+            print(f"DDS interface: {args.interface}")
+        run_pre_reveal_right_arm_hardware(
+            ArmHardwareConfig(
+                interface=args.interface,
+                domain_id=args.domain_id,
+                live=args.live_arm,
+                print_state=args.print_arm_state,
+            )
+        )
+        return
+
+    if args.real_hand_only:
+        symbol = args.symbol or random.choice(GESTURE_OPTIONS)
+        hand_config = config.hand_hardware
+        if not hand_config.enabled:
+            raise SystemExit("Real-hand-only mode requires the hand bridge to stay enabled.")
+        mode = "live DDS hand control" if hand_config.live else "dry-run DDS hand control"
+        print("Running physical Inspire hand only.")
+        print(f"Reveal gesture: {symbol}")
+        print(f"Hand bridge: {mode} on {hand_config.hand} hand")
+        if hand_config.interface is not None:
+            print(f"DDS interface: {hand_config.interface}")
+        run_hand_hardware_sequence(
+            HardwareScriptConfig(
+                sequence=(symbol,),
+                transition_seconds=hand_config.transition_seconds,
+                hold_seconds=hand_config.hold_seconds,
+                rate_hz=hand_config.rate_hz,
+                hand=hand_config.hand,
+                domain_id=hand_config.domain_id,
+                network_interface=hand_config.interface,
+                command_topic=hand_config.command_topic,
+                state_topic=hand_config.state_topic,
+                state_timeout_seconds=hand_config.state_timeout_seconds,
+                allow_state_fallback=hand_config.allow_state_fallback,
+                live=hand_config.live,
+                print_state=hand_config.print_state,
+                return_to_open=hand_config.return_to_open,
+            )
+        )
+        return
+
+    mujoco = import_mujoco()
     state = build_state(config)
     playback = speak_countdown(state)
 

@@ -126,6 +126,8 @@ class UnitreeDdsSession:
             if timeout_seconds is None:
                 return self._reader.take_one()
             return self._reader.take_one(timeout=duration(seconds=timeout_seconds))
+        except StopIteration:
+            return None
         except TimeoutError:
             return None
         except DDSException as exc:
