@@ -14,6 +14,8 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
     if candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
 
+from g1_rps.arm_hardware import _configure_unitree_sdk_trace_output, _validate_requested_interface
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -52,6 +54,9 @@ def main() -> None:
         received["sample"] = msg
         received["count"] = int(received["count"]) + 1
 
+    _validate_requested_interface(args.interface)
+    _configure_unitree_sdk_trace_output(args.interface)
+
     if args.interface is not None:
         ChannelFactoryInitialize(args.domain_id, args.interface)
     else:
@@ -85,4 +90,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

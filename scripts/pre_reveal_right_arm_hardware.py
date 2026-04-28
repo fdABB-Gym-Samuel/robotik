@@ -35,6 +35,16 @@ def parse_args() -> argparse.Namespace:
         help="CycloneDDS domain ID used by Unitree SDK2.",
     )
     parser.add_argument(
+        "--arm-dof",
+        type=int,
+        choices=(5, 7),
+        default=7,
+        help=(
+            "Match Unitree's official G1 arm example variant: "
+            "`5` for the 23-dof arm5 layout or `7` for the 29-dof arm7 layout."
+        ),
+    )
+    parser.add_argument(
         "--state-timeout-seconds",
         type=float,
         default=5.0,
@@ -58,6 +68,7 @@ def main() -> None:
     config = ArmHardwareConfig(
         interface=args.interface,
         domain_id=args.domain_id,
+        arm_dof=args.arm_dof,
         live=args.live,
         print_state=args.print_state,
         state_timeout_seconds=args.state_timeout_seconds,
@@ -67,4 +78,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

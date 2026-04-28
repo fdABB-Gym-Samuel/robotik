@@ -6,32 +6,19 @@ executes the final shoot thrust and never reveals rock, paper, or scissors.
 
 from __future__ import annotations
 
+import argparse
 import math
 import sys
 import threading
 import time
 import traceback
-from xml.etree import ElementTree
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+from xml.etree import ElementTree
 
-try:
+if TYPE_CHECKING:
     import mujoco
-    import mujoco.viewer
-except ModuleNotFoundError as exc:  # pragma: no cover - local setup guard
-    raise SystemExit(
-        "MuJoCo Python bindings are not installed. Enter `nix develop` first "
-        "before running this script."
-    ) from exc
-
-try:
-    import trimesh
-except ModuleNotFoundError as exc:  # pragma: no cover - local setup guard
-    raise SystemExit(
-        "The `trimesh` package is required to build the runtime-safe Unitree G1 scene. "
-        "Enter `nix develop` first."
-    ) from exc
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +38,26 @@ class JointInterface(Protocol):
 
     def sleep(self, time_sec: float) -> None:
         ...
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the Unitree G1 right-arm pre-reveal pumping motion in MuJoCo. "
+            "Use `--print-joints-only` to inspect the motion plan without launching the simulator."
+        )
+    )
+    parser.add_argument(
+        "--scene-path",
+        default=str(SCENE_PATH),
+        help="Optional path to the Unitree G1 MuJoCo scene XML.",
+    )
+    parser.add_argument(
+        "--print-joints-only",
+        action="store_true",
+        help="Print the motion summary and exit without importing MuJoCo or trimesh.",
+    )
+    return parser.parse_args()
 
 
 @dataclass(frozen=True)
@@ -186,16 +193,17 @@ class SimulatorArmInterface(JointInterface):
     """Simulator-side implementation with joint-limit safety clamps."""
 
     def __init__(self, xml_path: Path, control_dt: float) -> None:
+        self._mujoco = import_mujoco()
         if not xml_path.exists():
             raise SystemExit(f"Unitree G1 scene not found: {xml_path}")
         runtime_scene = ensure_runtime_scene(xml_path)
-        self.model = mujoco.MjModel.from_xml_path(str(runtime_scene))
-        self.data = mujoco.MjData(self.model)
+        self.model = self._mujoco.MjModel.from_xml_path(str(runtime_scene))
+        self.data = self._mujoco.MjData(self.model)
         self.control_dt = control_dt
         self.current_targets = setup_pose(MotionParameters())
 
     def _joint_id(self, joint_name: str) -> int:
-        joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        joint_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_JOINT, joint_name)
         if joint_id < 0:
             raise ValueError(f"Joint '{joint_name}' was not found in the Unitree G1 model.")
         return joint_id
@@ -223,7 +231,7 @@ class SimulatorArmInterface(JointInterface):
         if self.model.nu:
             self.data.ctrl[:] = 0.0
 
-        mujoco.mj_forward(self.model, self.data)
+        self._mujoco.mj_forward(self.model, self.data)
         self.current_targets = dict(joint_targets)
 
     def move_joints(self, joint_targets: dict[str, float], time_sec: float) -> None:
@@ -248,7 +256,7 @@ class SimulatorArmInterface(JointInterface):
 
     def launch_viewer_with_motion(self, motion_runner: callable) -> None:
         try:
-            with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
+            with self._mujoco.viewer.launch_passive(self.model, self.data) as viewer:
                 thread = threading.Thread(target=motion_runner, daemon=True)
                 thread.start()
                 while viewer.is_running() and thread.is_alive():
@@ -267,7 +275,7 @@ class SimulatorArmInterface(JointInterface):
                 print(f"Passive viewer failed. Details saved to {LOG_PATH}")
             thread = threading.Thread(target=motion_runner, daemon=True)
             thread.start()
-            mujoco.viewer._launch_internal(  # type: ignore[attr-defined]
+            self._mujoco.viewer._launch_internal(  # type: ignore[attr-defined]
                 self.model,
                 self.data,
                 run_physics_thread=False,
@@ -293,6 +301,7 @@ def run_pre_reveal_motion(robot: JointInterface, params: MotionParameters) -> No
 
 
 def ensure_runtime_scene(scene_path: Path) -> Path:
+    trimesh = import_trimesh()
     runtime_path = RUNTIME_SCENE_PATH
     runtime_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -342,7 +351,31 @@ def _flatten_rows(rows) -> str:
     return " ".join(" ".join(f"{value:.9g}" for value in row) for row in rows)
 
 
+def import_mujoco():
+    try:
+        import mujoco
+        import mujoco.viewer
+    except ModuleNotFoundError as exc:  # pragma: no cover - local setup guard
+        raise SystemExit(
+            "MuJoCo Python bindings are not installed. Enter `nix develop` first "
+            "before running this script."
+        ) from exc
+    return mujoco
+
+
+def import_trimesh():
+    try:
+        import trimesh
+    except ModuleNotFoundError as exc:  # pragma: no cover - local setup guard
+        raise SystemExit(
+            "The `trimesh` package is required to build the runtime-safe Unitree G1 scene. "
+            "Enter `nix develop` first."
+        ) from exc
+    return trimesh
+
+
 def main() -> None:
+    args = parse_args()
     params = MotionParameters()
     print("Right-arm pre-reveal control strategy:")
     print("I keep my torso stable, hold my concealed right hand in front of my torso,")
@@ -353,7 +386,10 @@ def main() -> None:
     print("Joint-level motion table:")
     print(joint_motion_table(params))
 
-    simulator = SimulatorArmInterface(SCENE_PATH, params.control_dt)
+    if args.print_joints_only:
+        return
+
+    simulator = SimulatorArmInterface(Path(args.scene_path), params.control_dt)
     simulator.launch_viewer_with_motion(lambda: run_pre_reveal_motion(simulator, params))
 
 
