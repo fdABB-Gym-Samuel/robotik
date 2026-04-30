@@ -435,9 +435,7 @@ class MjpegPreview:
                         self.wfile.write(
                             b"--frame\r\n"
                             b"Content-Type: image/jpeg\r\n"
-                            + f"Content-Length: {len(jpeg)}\r\n\r\n".encode(
-                                "ascii"
-                            )
+                            + f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii")
                             + jpeg
                             + b"\r\n"
                         )

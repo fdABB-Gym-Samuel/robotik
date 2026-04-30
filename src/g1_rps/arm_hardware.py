@@ -60,19 +60,67 @@ class G1JointIndex:
 G1_NUM_MOTOR = 29
 
 FULL_BODY_KP = [
-    60.0, 60.0, 60.0, 100.0, 40.0, 40.0,
-    60.0, 60.0, 60.0, 100.0, 40.0, 40.0,
-    60.0, 40.0, 40.0,
-    40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0,
-    40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0,
+    60.0,
+    60.0,
+    60.0,
+    100.0,
+    40.0,
+    40.0,
+    60.0,
+    60.0,
+    60.0,
+    100.0,
+    40.0,
+    40.0,
+    60.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
+    40.0,
 ]
 
 FULL_BODY_KD = [
-    1.0, 1.0, 1.0, 2.0, 1.0, 1.0,
-    1.0, 1.0, 1.0, 2.0, 1.0, 1.0,
-    1.0, 1.0, 1.0,
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0,
+    1.0,
+    1.0,
+    2.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    2.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
 ]
 
 
@@ -165,7 +213,9 @@ class ArmHardwareConfig:
 
     def __post_init__(self) -> None:
         if self.arm_dof not in (5, 7):
-            raise ValueError("arm_dof must be either 5 or 7 to match Unitree's official G1 arm examples.")
+            raise ValueError(
+                "arm_dof must be either 5 or 7 to match Unitree's official G1 arm examples."
+            )
 
 
 def commanded_right_arm_joints(config: ArmHardwareConfig) -> dict[str, int]:
@@ -339,7 +389,9 @@ class UnitreeLowCmdSession:
             from unitree_sdk2py.core.channel import ChannelFactoryInitialize
             from unitree_sdk2py.core.channel import ChannelPublisher
             from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
+            from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
+                MotionSwitcherClient,
+            )
             from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
@@ -551,7 +603,10 @@ class UnitreeLowCmdSession:
 
     def current_right_arm_pose(self) -> dict[str, float]:
         state = self.wait_for_state()
-        return [float(state.motor_state[joint_index].q) for joint_index in range(G1_NUM_MOTOR)]
+        return [
+            float(state.motor_state[joint_index].q)
+            for joint_index in range(G1_NUM_MOTOR)
+        ]
 
     def current_right_arm_pose(self) -> dict[str, float]:
         motor_positions = self.current_motor_positions()
