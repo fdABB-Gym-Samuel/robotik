@@ -56,6 +56,9 @@ def main() -> None:
         received["sample"] = msg
         received["count"] = int(received["count"]) + 1
 
+    _validate_requested_interface(args.interface)
+    _configure_unitree_sdk_trace_output(args.interface)
+
     if args.interface is not None:
         ChannelFactoryInitialize(args.domain_id, args.interface)
     else:

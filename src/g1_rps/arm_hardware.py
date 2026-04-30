@@ -23,6 +23,7 @@ import socket
 import time
 from importlib import metadata
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .unitree_sdk2_config import (
@@ -30,7 +31,15 @@ from .unitree_sdk2_config import (
 )
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+RUN_LOGS_DIR = PROJECT_ROOT / "runs" / "logs"
+UNITREE_SDK_TRACE_LOG = RUN_LOGS_DIR / "unitree_arm_sdk_cdds.log"
+
+
 class G1JointIndex:
+    WaistYaw = 12
+    WaistRoll = 13
+    WaistPitch = 14
     LeftShoulderPitch = 15
     LeftShoulderRoll = 16
     LeftShoulderYaw = 17
@@ -48,7 +57,31 @@ class G1JointIndex:
     kNotUsedJoint = 29
 
 
-RIGHT_ARM_JOINTS = {
+G1_NUM_MOTOR = 29
+
+FULL_BODY_KP = [
+    60.0, 60.0, 60.0, 100.0, 40.0, 40.0,
+    60.0, 60.0, 60.0, 100.0, 40.0, 40.0,
+    60.0, 40.0, 40.0,
+    40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0,
+    40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0,
+]
+
+FULL_BODY_KD = [
+    1.0, 1.0, 1.0, 2.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 2.0, 1.0, 1.0,
+    1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+]
+
+
+class Mode:
+    PR = 0
+    AB = 1
+
+
+RIGHT_ARM_7_JOINTS = {
     "right_shoulder_pitch_joint": G1JointIndex.RightShoulderPitch,
     "right_shoulder_roll_joint": G1JointIndex.RightShoulderRoll,
     "right_shoulder_yaw_joint": G1JointIndex.RightShoulderYaw,
@@ -56,6 +89,50 @@ RIGHT_ARM_JOINTS = {
     "right_wrist_roll_joint": G1JointIndex.RightWristRoll,
     "right_wrist_pitch_joint": G1JointIndex.RightWristPitch,
     "right_wrist_yaw_joint": G1JointIndex.RightWristYaw,
+}
+
+RIGHT_ARM_5_JOINTS = {
+    "right_shoulder_pitch_joint": G1JointIndex.RightShoulderPitch,
+    "right_shoulder_roll_joint": G1JointIndex.RightShoulderRoll,
+    "right_shoulder_yaw_joint": G1JointIndex.RightShoulderYaw,
+    "right_elbow_joint": G1JointIndex.RightElbow,
+    "right_wrist_roll_joint": G1JointIndex.RightWristRoll,
+}
+
+UPPER_BODY_7_JOINTS = {
+    "left_shoulder_pitch_joint": G1JointIndex.LeftShoulderPitch,
+    "left_shoulder_roll_joint": G1JointIndex.LeftShoulderRoll,
+    "left_shoulder_yaw_joint": G1JointIndex.LeftShoulderYaw,
+    "left_elbow_joint": G1JointIndex.LeftElbow,
+    "left_wrist_roll_joint": G1JointIndex.LeftWristRoll,
+    "left_wrist_pitch_joint": G1JointIndex.LeftWristPitch,
+    "left_wrist_yaw_joint": G1JointIndex.LeftWristYaw,
+    "right_shoulder_pitch_joint": G1JointIndex.RightShoulderPitch,
+    "right_shoulder_roll_joint": G1JointIndex.RightShoulderRoll,
+    "right_shoulder_yaw_joint": G1JointIndex.RightShoulderYaw,
+    "right_elbow_joint": G1JointIndex.RightElbow,
+    "right_wrist_roll_joint": G1JointIndex.RightWristRoll,
+    "right_wrist_pitch_joint": G1JointIndex.RightWristPitch,
+    "right_wrist_yaw_joint": G1JointIndex.RightWristYaw,
+    "waist_yaw_joint": G1JointIndex.WaistYaw,
+    "waist_roll_joint": G1JointIndex.WaistRoll,
+    "waist_pitch_joint": G1JointIndex.WaistPitch,
+}
+
+UPPER_BODY_5_JOINTS = {
+    "left_shoulder_pitch_joint": G1JointIndex.LeftShoulderPitch,
+    "left_shoulder_roll_joint": G1JointIndex.LeftShoulderRoll,
+    "left_shoulder_yaw_joint": G1JointIndex.LeftShoulderYaw,
+    "left_elbow_joint": G1JointIndex.LeftElbow,
+    "left_wrist_roll_joint": G1JointIndex.LeftWristRoll,
+    "right_shoulder_pitch_joint": G1JointIndex.RightShoulderPitch,
+    "right_shoulder_roll_joint": G1JointIndex.RightShoulderRoll,
+    "right_shoulder_yaw_joint": G1JointIndex.RightShoulderYaw,
+    "right_elbow_joint": G1JointIndex.RightElbow,
+    "right_wrist_roll_joint": G1JointIndex.RightWristRoll,
+    "waist_yaw_joint": G1JointIndex.WaistYaw,
+    "waist_roll_joint": G1JointIndex.WaistRoll,
+    "waist_pitch_joint": G1JointIndex.WaistPitch,
 }
 
 
@@ -66,6 +143,7 @@ NUM_G1_MOTORS = 29
 class ArmHardwareConfig:
     interface: str | None = None
     domain_id: int = 0
+    arm_dof: int = 7
     live: bool = False
     print_state: bool = False
     auto_release_mode: bool = True
@@ -84,6 +162,18 @@ class ArmHardwareConfig:
     hold_kd: float = 1.5
     arm_amplitude: float = 0.02
     wrist_angle: float = -0.18
+
+    def __post_init__(self) -> None:
+        if self.arm_dof not in (5, 7):
+            raise ValueError("arm_dof must be either 5 or 7 to match Unitree's official G1 arm examples.")
+
+
+def commanded_right_arm_joints(config: ArmHardwareConfig) -> dict[str, int]:
+    return RIGHT_ARM_7_JOINTS if config.arm_dof == 7 else RIGHT_ARM_5_JOINTS
+
+
+def commanded_upper_body_joints(config: ArmHardwareConfig) -> dict[str, int]:
+    return UPPER_BODY_7_JOINTS if config.arm_dof == 7 else UPPER_BODY_5_JOINTS
 
 
 RIGHT_ELBOW_90_DEG_Q = 0.262
@@ -130,6 +220,8 @@ def ready_right_arm_pose(config: ArmHardwareConfig) -> dict[str, float]:
         "right_wrist_pitch_joint": config.wrist_angle,
         "right_wrist_yaw_joint": -0.16,
     }
+    joint_names = commanded_right_arm_joints(config)
+    return {joint_name: pose[joint_name] for joint_name in joint_names}
 
 
 def interface_ipv4_address(interface: str | None) -> str | None:
@@ -150,6 +242,25 @@ def interface_ipv4_address(interface: str | None) -> str | None:
         return None
     finally:
         sock.close()
+
+
+def interface_link_status(interface: str | None) -> tuple[str | None, str | None]:
+    if interface is None:
+        return None, None
+
+    net_root = Path("/sys/class/net") / interface
+    try:
+        operstate = (net_root / "operstate").read_text(encoding="utf-8").strip()
+    except OSError:
+        operstate = None
+
+    try:
+        carrier_raw = (net_root / "carrier").read_text(encoding="utf-8").strip()
+        carrier = "up" if carrier_raw == "1" else "down"
+    except OSError:
+        carrier = None
+
+    return operstate, carrier
 
 
 def likely_wsl_nat_address(ipv4_address: str | None) -> bool:
@@ -200,12 +311,14 @@ def beat_arm_offset(
     wrist_pitch = 0.04 * extension
     wrist_roll = -0.03 * beat_index
 
-    return {
+    deltas = {
         "right_shoulder_pitch_joint": shoulder_pitch,
         "right_elbow_joint": elbow,
-        "right_wrist_pitch_joint": wrist_pitch,
         "right_wrist_roll_joint": wrist_roll,
     }
+    if config.arm_dof == 7:
+        deltas["right_wrist_pitch_joint"] = wrist_pitch
+    return deltas
 
 
 class UnitreeLowCmdSession:
@@ -226,6 +339,7 @@ class UnitreeLowCmdSession:
             from unitree_sdk2py.core.channel import ChannelFactoryInitialize
             from unitree_sdk2py.core.channel import ChannelPublisher
             from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
             from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
@@ -245,9 +359,14 @@ class UnitreeLowCmdSession:
             ChannelFactoryInitialize(config.domain_id)
 
         self._config = config
+        self._right_arm_joints = commanded_right_arm_joints(config)
         self._low_state: Any | None = None
         self._last_lowstate_error: Exception | None = None
         self._crc = CRC()
+        self._motion_switcher = MotionSwitcherClient()
+        self._motion_switcher.SetTimeout(5.0)
+        self._motion_switcher.Init()
+        self._motion_switcher_warning = self._release_active_motion_mode()
         self._low_cmd_factory = unitree_hg_msg_dds__LowCmd_
         self._maybe_release_high_level_mode()
         self._channel_factory = ChannelFactory()
@@ -278,8 +397,44 @@ class UnitreeLowCmdSession:
         self._hold_q: list[float] = [0.0] * NUM_G1_MOTORS
         self._cyclonedds_log_path = log_path
 
+    @property
+    def motion_switcher_warning(self) -> str | None:
+        return self._motion_switcher_warning
+
+    def _release_active_motion_mode(self) -> str | None:
+        status, result = self._motion_switcher.CheckMode()
+        if status != 0 or result is None:
+            return (
+                "MotionSwitcher RPC was unavailable, so the script could not confirm or release "
+                "the currently active robot motion mode before taking low-level control. "
+                "Continuing anyway because some setups do not expose that service."
+            )
+
+        deadline = time.perf_counter() + 15.0
+        while result.get("name"):
+            release_status, _ = self._motion_switcher.ReleaseMode()
+            if release_status != 0:
+                return (
+                    f"MotionSwitcher RPC found active mode `{result['name']}` but could not release it "
+                    "before low-level control. Continuing anyway, but another controller may still be competing."
+                )
+            if time.perf_counter() >= deadline:
+                return (
+                    f"Timed out while waiting for Unitree motion mode `{result['name']}` to release. "
+                    "Continuing anyway, but another controller may still be competing."
+                )
+            time.sleep(1.0)
+            status, result = self._motion_switcher.CheckMode()
+            if status != 0 or result is None:
+                return (
+                    "MotionSwitcher RPC stopped responding after a release request. "
+                    "Continuing anyway because low-level DDS control may still work."
+                )
+        return None
+
     def _low_state_handler(self, msg: Any) -> None:
         self._low_state = msg
+        self._mode_machine = int(getattr(msg, "mode_machine", 0))
 
     def _take_lowstate_sample(self) -> Any | None:
         try:
@@ -396,9 +551,13 @@ class UnitreeLowCmdSession:
 
     def current_right_arm_pose(self) -> dict[str, float]:
         state = self.wait_for_state()
+        return [float(state.motor_state[joint_index].q) for joint_index in range(G1_NUM_MOTOR)]
+
+    def current_right_arm_pose(self) -> dict[str, float]:
+        motor_positions = self.current_motor_positions()
         pose: dict[str, float] = {}
-        for joint_name, joint_index in RIGHT_ARM_JOINTS.items():
-            pose[joint_name] = float(state.motor_state[joint_index].q)
+        for joint_name, joint_index in self._right_arm_joints.items():
+            pose[joint_name] = motor_positions[joint_index]
         return pose
 
     def publish_pose(self, pose: dict[str, float]) -> None:
@@ -441,7 +600,10 @@ class UnitreeLowCmdSession:
         steps = max(1, int(duration / self._config.control_dt))
         for step in range(1, steps + 1):
             alpha = ease_in_out_cubic(step / steps)
-            pose = blend_pose(start_pose, target_pose, alpha)
+            positions = [
+                (1.0 - alpha) * start + alpha * target
+                for start, target in zip(start_positions, target_positions, strict=True)
+            ]
             if self._config.live:
                 self.publish_pose(pose)
             time.sleep(self._config.control_dt)
@@ -473,13 +635,24 @@ def _phase_pose(
     return add_joint_deltas(ready_pose, beat_arm_offset(config, local_time, beat_index))
 
 
+def _apply_right_arm_pose(
+    config: ArmHardwareConfig,
+    base_positions: list[float],
+    right_arm_pose: dict[str, float],
+) -> list[float]:
+    positions = list(base_positions)
+    for joint_name, joint_index in commanded_right_arm_joints(config).items():
+        positions[joint_index] = right_arm_pose[joint_name]
+    return positions
+
+
 def run_pre_reveal_right_arm_hardware(config: ArmHardwareConfig) -> None:
-    ready_pose = ready_right_arm_pose(config)
+    ready_right_pose = ready_right_arm_pose(config)
 
     if not config.live and not config.print_state:
         print("Dry run only. No real robot commands were sent.")
         print("Planned ready pose:")
-        for joint_name, value in ready_pose.items():
+        for joint_name, value in ready_right_pose.items():
             print(f"  {joint_name}: {value:+.3f}")
         return
 
@@ -489,7 +662,7 @@ def run_pre_reveal_right_arm_hardware(config: ArmHardwareConfig) -> None:
 
     if config.print_state:
         print("Initial right-arm joint state:")
-        for joint_name, value in start_pose.items():
+        for joint_name, value in start_right_pose.items():
             print(f"  {joint_name}: {value:+.3f}")
 
     if not config.live:
