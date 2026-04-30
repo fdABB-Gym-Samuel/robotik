@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+venv_dir="$repo_root/.venv"
+python_bin="${PYTHON_BIN:-python3}"
+
+if [ ! -d "$venv_dir" ]; then
+  "$python_bin" -m venv "$venv_dir"
+fi
+
+source "$venv_dir/bin/activate"
+python -m pip install --upgrade pip
+python -m pip install -r "$repo_root/requirements.txt"
+
+# MuJoCo's macOS mjpython launcher expects libpython to be reachable from the
+# venv root. uv-managed Python installs keep it outside the venv, so link it in.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  libpython_name="$(python - <<'PY'
+import sysconfig
+print(sysconfig.get_config_var("LDLIBRARY") or "")
+PY
+)"
+  libpython_dir="$(python - <<'PY'
+import sysconfig
+print(sysconfig.get_config_var("LIBDIR") or "")
+PY
+)"
+
+  if [ -n "$libpython_name" ] && [ -n "$libpython_dir" ] && [ -f "$libpython_dir/$libpython_name" ]; then
+    ln -sf "$libpython_dir/$libpython_name" "$venv_dir/$libpython_name"
+  fi
+fi
+
+echo "Virtual environment ready at $venv_dir"

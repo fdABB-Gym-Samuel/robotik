@@ -1,0 +1,9 @@
+Thu Apr 30 08:38:01 2026
+ERROR: mj_copyDataVisual: attempting to copy mjData while stack is in use
+
+Thu Apr 30 08:39:01 2026
+ERROR: mj_copyDataVisual: attempting to copy mjData while stack is in use
+
+Thu Apr 30 11:36:38 2026
+ERROR: could not create window
+

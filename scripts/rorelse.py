@@ -1,0 +1,1054 @@
+"""Run a Unitree G1 rock-paper-scissors demo with synchronized speech."""
+
+from __future__ import annotations
+
+import argparse
+import math
+import random
+import shutil
+import subprocess
+import sys
+import threading
+import traceback
+import time
+from xml.etree import ElementTree
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+for candidate in (PROJECT_ROOT, SRC_ROOT):
+    candidate_str = str(candidate)
+    if candidate_str not in sys.path:
+        sys.path.insert(0, candidate_str)
+
+if TYPE_CHECKING:
+    import mujoco
+
+from g1_rps.arm_hardware import ArmHardwareConfig, run_pre_reveal_right_arm_hardware
+from scripts.run_g1_rps_hand_hardware import HardwareConfig as HardwareScriptConfig
+from scripts.run_g1_rps_hand_hardware import (
+    run_hardware_sequence as run_hand_hardware_sequence,
+)
+
+SCENE_PATH = PROJECT_ROOT / "assets" / "unitree_g1" / "g1_29dof_with_hand.xml"
+LOG_PATH = PROJECT_ROOT / "runs" / "logs" / "rorelse-error.log"
+RUNTIME_SCENE_PATH = (
+    PROJECT_ROOT / "runs" / "assets" / "unitree_g1" / "g1_29dof_with_hand_runtime.xml"
+)
+FRAME_DT = 1.0 / 60.0
+GESTURE_OPTIONS = ("rock", "paper", "scissors")
+
+
+@dataclass(frozen=True)
+class TimingConfig:
+    prepare_duration: float = 0.8
+    beat_duration: float = 0.5
+    speech_offset: float = 0.0
+    anticipation_duration: float = 0.08
+    reveal_duration: float = 0.18
+    hold_duration: float = 1.7
+    return_duration: float = 1.0
+    idle_duration: float = 0.5
+
+
+@dataclass(frozen=True)
+class MotionConfig:
+    base_height: float = 0.79
+    arm_amplitude: float = 0.18
+    wrist_angle: float = -0.18
+    finger_open_close_gain: float = 1.0
+
+
+@dataclass(frozen=True)
+class SpeechConfig:
+    voice: str = "Samantha"
+    rate: int = 185
+    startup_latency: float = 0.12
+    estimated_word_duration: float = 0.22
+
+
+@dataclass(frozen=True)
+class HandBridgeConfig:
+    enabled: bool = True
+    live: bool = False
+    hand: str = "right"
+    transition_seconds: float = 0.18
+    hold_seconds: float = 1.7
+    rate_hz: float = 25.0
+    domain_id: int = 0
+    interface: str | None = None
+    command_topic: str = "rt/inspire/cmd"
+    state_topic: str = "rt/inspire/state"
+    state_timeout_seconds: float = 1.0
+    print_state: bool = False
+    return_to_open: bool = False
+    allow_state_fallback: bool = False
+
+
+@dataclass(frozen=True)
+class DemoConfig:
+    scene_path: Path = SCENE_PATH
+    frame_dt: float = FRAME_DT
+    timing: TimingConfig = TimingConfig()
+    motion: MotionConfig = MotionConfig()
+    speech: SpeechConfig = SpeechConfig()
+    hand_hardware: HandBridgeConfig = HandBridgeConfig()
+
+
+@dataclass(frozen=True)
+class SpeechCue:
+    time_s: float
+    text: str
+
+
+@dataclass
+class DemoState:
+    model: "mujoco.MjModel"
+    data: "mujoco.MjData"
+    config: DemoConfig
+    symbol: str
+    idle_pose: dict[str, float]
+    ready_pose: dict[str, float]
+    reveal_pose: dict[str, float]
+    speech_playback: "SpeechPlayback | None" = None
+    cycle_started_at: float = 0.0
+    hand_reveal_started: bool = False
+
+
+class SpeechBackend:
+    def speak_async(self, text: str) -> None:  # pragma: no cover - interface method
+        raise NotImplementedError
+
+    def close(self) -> None:
+        """Release backend resources."""
+
+
+class MacSayBackend(SpeechBackend):
+    def __init__(self, config: SpeechConfig) -> None:
+        self._config = config
+        self._processes: list[subprocess.Popen[bytes]] = []
+
+    def speak_async(self, text: str) -> None:
+        process = subprocess.Popen(
+            [
+                "say",
+                "-v",
+                self._config.voice,
+                "-r",
+                str(self._config.rate),
+                text,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._processes.append(process)
+        self._processes = [proc for proc in self._processes if proc.poll() is None]
+
+    def close(self) -> None:
+        for process in self._processes:
+            if process.poll() is None:
+                process.terminate()
+        self._processes.clear()
+
+
+class PrintSpeechBackend(SpeechBackend):
+    def speak_async(self, text: str) -> None:
+        print(f"[speech] {text}")
+
+
+@dataclass
+class SpeechPlayback:
+    backend: SpeechBackend
+    phrase: str
+    anchor_delay: float
+    started_at: float | None = None
+    anchor_time: float | None = None
+
+    def start(self, now: float) -> None:
+        if self.started_at is not None:
+            return
+        self.backend.speak_async(self.phrase)
+        self.started_at = now
+        self.anchor_time = now + self.anchor_delay
+
+    def elapsed(self, now: float) -> float | None:
+        if self.anchor_time is None:
+            return None
+        return now - self.anchor_time
+
+    def reset(self) -> None:
+        self.started_at = None
+        self.anchor_time = None
+
+    def close(self) -> None:
+        self.backend.close()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the Unitree G1 rock-paper-scissors demo with MuJoCo body motion, "
+            "local speech, and an optional real Inspire hand reveal over DDS."
+        )
+    )
+    parser.add_argument(
+        "--live-hand",
+        action="store_true",
+        help="Publish the reveal gesture to the real Inspire hand over DDS.",
+    )
+    parser.add_argument(
+        "--real-hand-only",
+        action="store_true",
+        help="Skip MuJoCo and send the reveal gesture only to the physical Inspire hand.",
+    )
+    parser.add_argument(
+        "--real-arm-only",
+        action="store_true",
+        help="Skip MuJoCo and run only the rhythmic pre-reveal motion on the physical G1 right arm.",
+    )
+    parser.add_argument(
+        "--disable-hand",
+        action="store_true",
+        help="Disable the imported hardware-hand trigger entirely.",
+    )
+    parser.add_argument(
+        "--interface",
+        default=None,
+        help="Optional CycloneDDS network interface, for example `en5` or `eth0`.",
+    )
+    parser.add_argument(
+        "--domain-id",
+        type=int,
+        default=0,
+        help="CycloneDDS domain ID used for the Inspire hand topics.",
+    )
+    parser.add_argument(
+        "--print-hand-state",
+        action="store_true",
+        help="Print outgoing hand commands and any received Inspire hand state.",
+    )
+    parser.add_argument(
+        "--print-arm-state",
+        action="store_true",
+        help="Print the initial right-arm `rt/lowstate` sample in --real-arm-only mode.",
+    )
+    parser.add_argument(
+        "--hand",
+        choices=("right",),
+        default="right",
+        help="Which physical Inspire hand to command. Only the right hand is calibrated.",
+    )
+    parser.add_argument(
+        "--hand-transition-seconds",
+        type=float,
+        default=0.18,
+        help="Seconds used to interpolate into the final reveal on the real hand.",
+    )
+    parser.add_argument(
+        "--hand-hold-seconds",
+        type=float,
+        default=1.7,
+        help="Seconds to hold the final reveal on the real hand.",
+    )
+    parser.add_argument(
+        "--return-hand-to-open",
+        action="store_true",
+        help="Return the real hand to the open paper pose after each reveal.",
+    )
+    parser.add_argument(
+        "--live-arm",
+        action="store_true",
+        help="Actually publish `rt/arm_sdk` commands in --real-arm-only mode.",
+    )
+    parser.add_argument(
+        "--allow-state-fallback",
+        action="store_true",
+        help="Allow a less safe synthetic open-state fallback if no initial hand state is received.",
+    )
+    parser.add_argument(
+        "--symbol",
+        choices=GESTURE_OPTIONS,
+        default=None,
+        help="Gesture to reveal in --real-hand-only mode. Defaults to a random choice.",
+    )
+    return parser.parse_args()
+
+
+def build_demo_config(args: argparse.Namespace) -> DemoConfig:
+    hand_hardware = HandBridgeConfig(
+        enabled=not args.disable_hand,
+        live=args.live_hand,
+        hand=args.hand,
+        transition_seconds=args.hand_transition_seconds,
+        hold_seconds=args.hand_hold_seconds,
+        domain_id=args.domain_id,
+        interface=args.interface,
+        print_state=args.print_hand_state,
+        return_to_open=args.return_hand_to_open,
+        allow_state_fallback=args.allow_state_fallback,
+    )
+    return DemoConfig(hand_hardware=hand_hardware)
+
+
+def choose_speech_backend(config: SpeechConfig) -> SpeechBackend:
+    if shutil.which("say"):
+        return MacSayBackend(config)
+    return PrintSpeechBackend()
+
+
+def import_mujoco():
+    try:
+        import mujoco
+        import mujoco.viewer
+    except (
+        ModuleNotFoundError
+    ) as exc:  # pragma: no cover - import guard for local setup
+        raise SystemExit(
+            "MuJoCo Python bindings are not installed. Enter `nix develop` first before running viewer mode."
+        ) from exc
+    return mujoco
+
+
+def import_trimesh():
+    try:
+        import trimesh
+    except (
+        ModuleNotFoundError
+    ) as exc:  # pragma: no cover - import guard for local setup
+        raise SystemExit(
+            "The `trimesh` package is required to build the runtime-safe Unitree G1 scene. "
+            "Enter `nix develop` first."
+        ) from exc
+    return trimesh
+
+
+def ease_in_out_cubic(alpha: float) -> float:
+    alpha = clamp_unit(alpha)
+    if alpha < 0.5:
+        return 4.0 * alpha * alpha * alpha
+    return 1.0 - pow(-2.0 * alpha + 2.0, 3.0) / 2.0
+
+
+def clamp_unit(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def blend_pose(
+    start: dict[str, float], target: dict[str, float], alpha: float
+) -> dict[str, float]:
+    alpha = clamp_unit(alpha)
+    joint_names = set(start) | set(target)
+    return {
+        joint_name: (1.0 - alpha) * start.get(joint_name, 0.0)
+        + alpha * target.get(joint_name, 0.0)
+        for joint_name in joint_names
+    }
+
+
+def add_pose_layers(*layers: dict[str, float]) -> dict[str, float]:
+    pose: dict[str, float] = {}
+    for layer in layers:
+        pose.update(layer)
+    return pose
+
+
+def add_joint_deltas(
+    base_pose: dict[str, float], deltas: dict[str, float]
+) -> dict[str, float]:
+    updated_pose = dict(base_pose)
+    for joint_name, delta in deltas.items():
+        updated_pose[joint_name] = updated_pose.get(joint_name, 0.0) + delta
+    return updated_pose
+
+
+def set_joint_position(
+    model: mujoco.MjModel, data: mujoco.MjData, joint_name: str, value: float
+) -> None:
+    mujoco = import_mujoco()
+    joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+    if joint_id < 0:
+        raise ValueError(f"Joint '{joint_name}' was not found in the Unitree G1 model.")
+
+    if model.jnt_limited[joint_id]:
+        low, high = model.jnt_range[joint_id]
+        value = max(float(low), min(float(high), value))
+
+    data.qpos[model.jnt_qposadr[joint_id]] = value
+
+
+def stable_lower_body_pose() -> dict[str, float]:
+    return {
+        "left_hip_pitch_joint": -0.32,
+        "left_knee_joint": 0.64,
+        "left_ankle_pitch_joint": -0.33,
+        "right_hip_pitch_joint": -0.32,
+        "right_knee_joint": 0.64,
+        "right_ankle_pitch_joint": -0.33,
+    }
+
+
+def relaxed_left_arm_pose() -> dict[str, float]:
+    return {
+        "left_shoulder_pitch_joint": 0.22,
+        "left_shoulder_roll_joint": 0.1,
+        "left_shoulder_yaw_joint": -0.08,
+        "left_elbow_joint": 0.48,
+        "left_wrist_roll_joint": 0.02,
+        "left_wrist_pitch_joint": 0.0,
+        "left_wrist_yaw_joint": 0.0,
+    }
+
+
+def neutral_right_arm_pose() -> dict[str, float]:
+    return {
+        "right_shoulder_pitch_joint": 0.24,
+        "right_shoulder_roll_joint": -0.12,
+        "right_shoulder_yaw_joint": 0.02,
+        "right_elbow_joint": 0.55,
+        "right_wrist_roll_joint": 0.0,
+        "right_wrist_pitch_joint": 0.0,
+        "right_wrist_yaw_joint": 0.0,
+    }
+
+
+def relaxed_right_hand_pose() -> dict[str, float]:
+    # Idle hand shape when no rock-paper-scissors gesture is being shown.
+    return {
+        "right_hand_thumb_0_joint": 0.18,
+        "right_hand_thumb_1_joint": -0.1,
+        "right_hand_thumb_2_joint": -0.18,
+        "right_hand_index_0_joint": 0.2,
+        "right_hand_index_1_joint": 0.25,
+        "right_hand_middle_0_joint": 0.22,
+        "right_hand_middle_1_joint": 0.28,
+    }
+
+
+def play_ready_arm_pose(config: MotionConfig) -> dict[str, float]:
+    return {
+        "waist_yaw_joint": -0.08,
+        "waist_roll_joint": -0.03,
+        "waist_pitch_joint": 0.04,
+        "right_shoulder_pitch_joint": -0.42,
+        "right_shoulder_roll_joint": -0.62,
+        "right_shoulder_yaw_joint": 0.18,
+        "right_elbow_joint": 1.18,
+        "right_wrist_roll_joint": -0.08,
+        "right_wrist_pitch_joint": config.wrist_angle,
+        "right_wrist_yaw_joint": -0.16,
+    }
+
+
+def beat_arm_offset(
+    config: MotionConfig, local_time: float, beat_duration: float, beat_index: int
+) -> dict[str, float]:
+    normalized = clamp_unit(local_time / beat_duration)
+    downbeat = math.exp(-18.0 * normalized) if normalized > 0.0 else 1.0
+    rebound = math.sin(math.pi * normalized)
+    amplitude = config.arm_amplitude
+
+    shoulder_pitch = -amplitude * (0.95 * downbeat - 0.2 * rebound)
+    elbow = 0.36 * downbeat - 0.08 * rebound
+    wrist_pitch = 0.1 * downbeat
+    wrist_roll = -0.03 * beat_index
+
+    return {
+        "right_shoulder_pitch_joint": shoulder_pitch,
+        "right_elbow_joint": elbow,
+        "right_wrist_pitch_joint": wrist_pitch,
+        "right_wrist_roll_joint": wrist_roll,
+    }
+
+
+def countdown_hand_pose() -> dict[str, float]:
+    # Closed "ready" hand used during the spoken countdown.
+    return {
+        "right_hand_thumb_0_joint": 0.26,
+        "right_hand_thumb_1_joint": -0.08,
+        "right_hand_thumb_2_joint": -0.22,
+        "right_hand_index_0_joint": 0.42,
+        "right_hand_index_1_joint": 0.45,
+        "right_hand_middle_0_joint": 0.45,
+        "right_hand_middle_1_joint": 0.48,
+    }
+
+
+def anticipation_hand_pose() -> dict[str, float]:
+    # Hand pose held just before the final reveal.
+    return {
+        "right_hand_thumb_0_joint": 0.26,
+        "right_hand_thumb_1_joint": -0.08,
+        "right_hand_thumb_2_joint": -0.22,
+        "right_hand_index_0_joint": 0.42,
+        "right_hand_index_1_joint": 0.45,
+        "right_hand_middle_0_joint": 0.45,
+        "right_hand_middle_1_joint": 0.48,
+    }
+
+
+def final_hand_pose(symbol: str, config: MotionConfig) -> dict[str, float]:
+    # Final revealed hand gestures for rock, paper, and scissors.
+    gain = config.finger_open_close_gain
+    poses = {
+        "rock": {
+            "right_hand_thumb_0_joint": 0.82 * gain,
+            "right_hand_thumb_1_joint": 0.36 * gain,
+            "right_hand_thumb_2_joint": -1.08 * gain,
+            "right_hand_index_0_joint": 1.28 * gain,
+            "right_hand_index_1_joint": 1.42 * gain,
+            "right_hand_middle_0_joint": 1.28 * gain,
+            "right_hand_middle_1_joint": 1.42 * gain,
+        },
+        "paper": {
+            "right_hand_thumb_0_joint": 0.12,
+            "right_hand_thumb_1_joint": -0.24,
+            "right_hand_thumb_2_joint": -0.05,
+            "right_hand_index_0_joint": 0.04,
+            "right_hand_index_1_joint": 0.02,
+            "right_hand_middle_0_joint": 0.04,
+            "right_hand_middle_1_joint": 0.02,
+        },
+        "scissors": {
+            "right_hand_thumb_0_joint": 0.7,
+            "right_hand_thumb_1_joint": 0.18,
+            "right_hand_thumb_2_joint": -0.88,
+            "right_hand_index_0_joint": 0.02,
+            "right_hand_index_1_joint": 0.02,
+            "right_hand_middle_0_joint": 0.02,
+            "right_hand_middle_1_joint": 0.02,
+        },
+    }
+    return poses[symbol]
+
+
+def trigger_hardware_hand_gesture(state: DemoState) -> None:
+    hand_config = state.config.hand_hardware
+    if not hand_config.enabled:
+        return
+
+    def runner() -> None:
+        try:
+            run_hand_hardware_sequence(
+                HardwareScriptConfig(
+                    sequence=(state.symbol,),
+                    transition_seconds=hand_config.transition_seconds,
+                    hold_seconds=hand_config.hold_seconds,
+                    rate_hz=hand_config.rate_hz,
+                    hand=hand_config.hand,
+                    domain_id=hand_config.domain_id,
+                    network_interface=hand_config.interface,
+                    command_topic=hand_config.command_topic,
+                    state_topic=hand_config.state_topic,
+                    state_timeout_seconds=hand_config.state_timeout_seconds,
+                    allow_state_fallback=hand_config.allow_state_fallback,
+                    live=hand_config.live,
+                    print_state=hand_config.print_state,
+                    return_to_open=hand_config.return_to_open,
+                )
+            )
+        except Exception as exc:
+            print(f"Hardware hand trigger failed: {exc}")
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LOG_PATH.write_text(traceback.format_exc(), encoding="utf-8")
+
+    threading.Thread(target=runner, daemon=True).start()
+
+
+def reveal_arm_pose(symbol: str, config: MotionConfig) -> dict[str, float]:
+    base_pose = {
+        "waist_yaw_joint": -0.12,
+        "waist_roll_joint": -0.03,
+        "waist_pitch_joint": 0.03,
+        "right_shoulder_pitch_joint": -0.56,
+        "right_shoulder_roll_joint": -0.78,
+        "right_shoulder_yaw_joint": 0.26,
+        "right_elbow_joint": 1.02,
+        "right_wrist_roll_joint": -0.06,
+        "right_wrist_pitch_joint": config.wrist_angle - 0.02,
+        "right_wrist_yaw_joint": -0.22,
+    }
+
+    if symbol == "paper":
+        base_pose["right_wrist_pitch_joint"] = config.wrist_angle - 0.14
+    elif symbol == "scissors":
+        base_pose["right_wrist_yaw_joint"] = -0.34
+        base_pose["right_wrist_pitch_joint"] = config.wrist_angle - 0.06
+    else:
+        base_pose["right_wrist_pitch_joint"] = config.wrist_angle + 0.04
+
+    return base_pose
+
+
+def reveal_accent_arm_pose(symbol: str, config: MotionConfig) -> dict[str, float]:
+    accent_pose = dict(reveal_arm_pose(symbol, config))
+    accent_pose["right_shoulder_pitch_joint"] -= 0.1
+    accent_pose["right_elbow_joint"] += 0.08
+    accent_pose["right_wrist_pitch_joint"] -= 0.12
+    return accent_pose
+
+
+def whole_body_stabilization_pose() -> dict[str, float]:
+    return add_pose_layers(
+        stable_lower_body_pose(),
+        relaxed_left_arm_pose(),
+    )
+
+
+def configure_camera(viewer: mujoco.viewer.Handle) -> None:
+    viewer.cam.distance = 3.0
+    viewer.cam.azimuth = 148
+    viewer.cam.elevation = -18
+    viewer.cam.lookat[:] = [0.0, -0.08, 0.82]
+
+
+def speech_cues(config: DemoConfig) -> list[SpeechCue]:
+    beat = config.timing.beat_duration
+    return [
+        SpeechCue(0.0 * beat, "Rock"),
+        SpeechCue(1.0 * beat, "Paper"),
+        SpeechCue(2.0 * beat, "Scissors"),
+        SpeechCue(3.0 * beat, "Shoot!"),
+    ]
+
+
+def build_countdown_phrase(config: DemoConfig) -> str:
+    cues = speech_cues(config)
+    pause_ms = max(
+        0,
+        int(
+            (config.timing.beat_duration - config.speech.estimated_word_duration) * 1000
+        ),
+    )
+    chunks: list[str] = []
+    for index, cue in enumerate(cues):
+        chunks.append(cue.text)
+        if index < len(cues) - 1 and pause_ms > 0:
+            chunks.append(f"[[slnc {pause_ms}]]")
+    return " ".join(chunks)
+
+
+def build_idle_pose() -> dict[str, float]:
+    return add_pose_layers(
+        whole_body_stabilization_pose(),
+        neutral_right_arm_pose(),
+        relaxed_right_hand_pose(),
+    )
+
+
+def build_ready_pose(config: MotionConfig) -> dict[str, float]:
+    return add_pose_layers(
+        whole_body_stabilization_pose(),
+        play_ready_arm_pose(config),
+        countdown_hand_pose(),
+    )
+
+
+def build_reveal_pose(symbol: str, config: MotionConfig) -> dict[str, float]:
+    # Combines the final arm position with the final hand gesture reveal.
+    return add_pose_layers(
+        whole_body_stabilization_pose(),
+        reveal_arm_pose(symbol, config),
+        final_hand_pose(symbol, config),
+    )
+
+
+def apply_pose(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    config: DemoConfig,
+    pose: dict[str, float],
+) -> None:
+    mujoco = import_mujoco()
+    data.qpos[:] = 0.0
+    data.qvel[:] = 0.0
+    data.qpos[:7] = [0.0, 0.0, config.motion.base_height, 1.0, 0.0, 0.0, 0.0]
+
+    for joint_name, value in pose.items():
+        set_joint_position(model, data, joint_name, value)
+
+    if model.nu:
+        data.ctrl[:] = 0.0
+
+    mujoco.mj_forward(model, data)
+
+
+def prepare(state: DemoState, elapsed: float) -> dict[str, float]:
+    alpha = ease_in_out_cubic(elapsed / state.config.timing.prepare_duration)
+    return blend_pose(state.idle_pose, state.ready_pose, alpha)
+
+
+def speak_countdown(state: DemoState) -> SpeechPlayback:
+    backend = choose_speech_backend(state.config.speech)
+    playback = SpeechPlayback(
+        backend=backend,
+        phrase=build_countdown_phrase(state.config),
+        anchor_delay=state.config.speech.startup_latency
+        + state.config.timing.speech_offset,
+    )
+    state.speech_playback = playback
+    return playback
+
+
+def countdown_motion(state: DemoState, elapsed: float) -> dict[str, float]:
+    beat_duration = state.config.timing.beat_duration
+    beat_index = min(int(elapsed / beat_duration), 2)
+    local_time = elapsed - beat_index * beat_duration
+
+    base_pose = add_joint_deltas(
+        state.ready_pose,
+        beat_arm_offset(state.config.motion, local_time, beat_duration, beat_index),
+    )
+
+    shoot_time = 3.0 * beat_duration
+    anticipation_start = max(
+        shoot_time - state.config.timing.anticipation_duration, 0.0
+    )
+    if elapsed >= anticipation_start:
+        anticipation_alpha = ease_in_out_cubic(
+            (elapsed - anticipation_start) / state.config.timing.anticipation_duration
+        )
+        anticipation_pose = add_pose_layers(
+            whole_body_stabilization_pose(),
+            add_joint_deltas(
+                play_ready_arm_pose(state.config.motion),
+                {
+                    "right_shoulder_pitch_joint": 0.08,
+                    "right_elbow_joint": -0.08,
+                    "right_wrist_pitch_joint": 0.06,
+                },
+            ),
+            countdown_hand_pose(),
+        )
+        base_pose = blend_pose(base_pose, anticipation_pose, anticipation_alpha)
+
+    # Keep the hand loosely engaged during the spoken beats.
+    hand_alpha = 0.45 + 0.15 * math.sin(
+        2.0 * math.pi * clamp_unit(local_time / beat_duration)
+    )
+    hand_pose = blend_pose(relaxed_right_hand_pose(), countdown_hand_pose(), hand_alpha)
+    base_pose.update(hand_pose)
+    return base_pose
+
+
+def reveal(state: DemoState, symbol: str, elapsed: float) -> dict[str, float]:
+    # Transitions from the pre-reveal hand shape into the chosen final gesture.
+    anticipation_alpha = clamp_unit(elapsed / state.config.timing.anticipation_duration)
+    anticipation_pose = add_pose_layers(
+        whole_body_stabilization_pose(),
+        reveal_accent_arm_pose(symbol, state.config.motion),
+        anticipation_hand_pose(),
+    )
+
+    if elapsed <= state.config.timing.anticipation_duration:
+        return blend_pose(
+            state.ready_pose, anticipation_pose, ease_in_out_cubic(anticipation_alpha)
+        )
+
+    reveal_elapsed = elapsed - state.config.timing.anticipation_duration
+    reveal_alpha = ease_in_out_cubic(
+        reveal_elapsed / state.config.timing.reveal_duration
+    )
+    return blend_pose(anticipation_pose, state.reveal_pose, reveal_alpha)
+
+
+def hold(state: DemoState, _elapsed: float) -> dict[str, float]:
+    return dict(state.reveal_pose)
+
+
+def return_to_idle(state: DemoState, elapsed: float) -> dict[str, float]:
+    alpha = ease_in_out_cubic(elapsed / state.config.timing.return_duration)
+    return blend_pose(state.reveal_pose, state.idle_pose, alpha)
+
+
+def begin_new_cycle(state: DemoState, now: float) -> None:
+    state.symbol = random.choice(GESTURE_OPTIONS)
+    state.reveal_pose = build_reveal_pose(state.symbol, state.config.motion)
+    state.cycle_started_at = now
+    state.hand_reveal_started = False
+    if state.speech_playback is not None:
+        state.speech_playback.reset()
+    print(f"Next reveal: {state.symbol}")
+
+
+def build_state(config: DemoConfig) -> DemoState:
+    mujoco = import_mujoco()
+    if not config.scene_path.exists():
+        raise SystemExit(f"Unitree G1 scene not found: {config.scene_path}")
+
+    model_path = ensure_runtime_scene(config.scene_path)
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+    data = mujoco.MjData(model)
+    initial_symbol = random.choice(GESTURE_OPTIONS)
+    state = DemoState(
+        model=model,
+        data=data,
+        config=config,
+        symbol=initial_symbol,
+        idle_pose=build_idle_pose(),
+        ready_pose=build_ready_pose(config.motion),
+        reveal_pose=build_reveal_pose(initial_symbol, config.motion),
+    )
+    return state
+
+
+def ensure_runtime_scene(scene_path: Path) -> Path:
+    trimesh = import_trimesh()
+    runtime_path = RUNTIME_SCENE_PATH
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tree = ElementTree.parse(scene_path)
+    root = tree.getroot()
+    compiler = root.find("compiler")
+    meshdir = compiler.get("meshdir", "") if compiler is not None else ""
+    base_mesh_dir = (scene_path.parent / meshdir).resolve()
+
+    asset = root.find("asset")
+    if asset is None:
+        raise SystemExit(f"Scene does not contain an <asset> section: {scene_path}")
+
+    source_mtimes = [scene_path.stat().st_mtime]
+    for mesh in asset.findall("mesh"):
+        mesh_file = mesh.get("file")
+        if not mesh_file:
+            continue
+        mesh_path = (base_mesh_dir / mesh_file).resolve()
+        if mesh_path.exists():
+            source_mtimes.append(mesh_path.stat().st_mtime)
+
+    if runtime_path.exists() and runtime_path.stat().st_mtime >= max(source_mtimes):
+        return runtime_path
+
+    for mesh in asset.findall("mesh"):
+        mesh_file = mesh.get("file")
+        if not mesh_file:
+            continue
+        mesh_path = (base_mesh_dir / mesh_file).resolve()
+        loaded = trimesh.load_mesh(mesh_path, force="mesh")
+        if isinstance(loaded, trimesh.Scene):
+            loaded = trimesh.util.concatenate(tuple(loaded.geometry.values()))
+        vertices = loaded.vertices
+        faces = loaded.faces
+        mesh.attrib.pop("file", None)
+        mesh.set("vertex", _flatten_rows(vertices))
+        mesh.set("face", _flatten_rows(faces))
+
+    if compiler is not None and "meshdir" in compiler.attrib:
+        compiler.attrib.pop("meshdir", None)
+
+    ElementTree.indent(tree, space="  ")
+    tree.write(runtime_path, encoding="utf-8", xml_declaration=False)
+    return runtime_path
+
+
+def _flatten_rows(rows) -> str:
+    return " ".join(" ".join(f"{value:.9g}" for value in row) for row in rows)
+
+
+def phase_pose(state: DemoState, now: float, elapsed: float) -> dict[str, float]:
+    timing = state.config.timing
+    prepare_end = timing.prepare_duration
+    shoot_start = 3.0 * timing.beat_duration
+    reveal_end = shoot_start + timing.anticipation_duration + timing.reveal_duration
+    hold_end = reveal_end + timing.hold_duration
+    return_end = hold_end + timing.return_duration
+
+    if elapsed < prepare_end:
+        return prepare(state, elapsed)
+
+    if state.speech_playback is not None and state.speech_playback.started_at is None:
+        state.speech_playback.start(now)
+
+    speech_elapsed = (
+        state.speech_playback.elapsed(now)
+        if state.speech_playback is not None
+        else None
+    )
+    if speech_elapsed is None or speech_elapsed < 0.0:
+        return dict(state.ready_pose)
+
+    if speech_elapsed < shoot_start:
+        return countdown_motion(state, speech_elapsed)
+    if speech_elapsed < reveal_end:
+        if not state.hand_reveal_started:
+            trigger_hardware_hand_gesture(state)
+            state.hand_reveal_started = True
+        reveal_elapsed = speech_elapsed - shoot_start
+        return reveal(state, state.symbol, reveal_elapsed)
+    if speech_elapsed < hold_end:
+        return hold(state, speech_elapsed - reveal_end)
+    if speech_elapsed < return_end:
+        return return_to_idle(state, speech_elapsed - hold_end)
+    return dict(state.idle_pose)
+
+
+def cycle_duration(config: DemoConfig) -> float:
+    timing = config.timing
+    return (
+        timing.prepare_duration
+        + max(config.speech.startup_latency + timing.speech_offset, 0.0)
+        + 3.0 * timing.beat_duration
+        + timing.anticipation_duration
+        + timing.reveal_duration
+        + timing.hold_duration
+        + timing.return_duration
+        + timing.idle_duration
+    )
+
+
+def animation_loop(state: DemoState, stop_event: threading.Event) -> None:
+    begin_new_cycle(state, now=time.perf_counter())
+
+    while not stop_event.is_set():
+        now = time.perf_counter()
+        elapsed = now - state.cycle_started_at
+        current_cycle_duration = cycle_duration(state.config)
+
+        if elapsed >= current_cycle_duration:
+            begin_new_cycle(state, now)
+            elapsed = 0.0
+
+        pose = phase_pose(state, now, elapsed)
+        apply_pose(state.model, state.data, state.config, pose)
+        time.sleep(state.config.frame_dt)
+
+
+def launch_blocking_fallback(state: DemoState, playback: SpeechPlayback) -> None:
+    mujoco = import_mujoco()
+    print("Passive viewer failed. Falling back to blocking viewer.")
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=animation_loop, args=(state, stop_event), daemon=True
+    )
+    thread.start()
+    try:
+        mujoco.viewer._launch_internal(  # type: ignore[attr-defined]
+            state.model,
+            state.data,
+            run_physics_thread=False,
+            show_left_ui=True,
+            show_right_ui=True,
+        )
+    finally:
+        stop_event.set()
+        thread.join(timeout=1.0)
+        playback.close()
+
+
+def is_macos_mjpython_requirement(error: Exception) -> bool:
+    return sys.platform == "darwin" and "run under `mjpython` on macOS" in str(error)
+
+
+def main() -> None:
+    args = parse_args()
+    config = build_demo_config(args)
+    if args.real_arm_only:
+        print("Running physical G1 right arm only.")
+        print("Motion: rhythmic pre-reveal rocking from the concealed ready pose")
+        if args.interface is not None:
+            print(f"DDS interface: {args.interface}")
+        run_pre_reveal_right_arm_hardware(
+            ArmHardwareConfig(
+                interface=args.interface,
+                domain_id=args.domain_id,
+                live=args.live_arm,
+                print_state=args.print_arm_state,
+            )
+        )
+        return
+
+    if args.real_hand_only:
+        symbol = args.symbol or random.choice(GESTURE_OPTIONS)
+        hand_config = config.hand_hardware
+        if not hand_config.enabled:
+            raise SystemExit(
+                "Real-hand-only mode requires the hand bridge to stay enabled."
+            )
+        mode = (
+            "live DDS hand control" if hand_config.live else "dry-run DDS hand control"
+        )
+        print("Running physical Inspire hand only.")
+        print(f"Reveal gesture: {symbol}")
+        print(f"Hand bridge: {mode} on {hand_config.hand} hand")
+        if hand_config.interface is not None:
+            print(f"DDS interface: {hand_config.interface}")
+        run_hand_hardware_sequence(
+            HardwareScriptConfig(
+                sequence=(symbol,),
+                transition_seconds=hand_config.transition_seconds,
+                hold_seconds=hand_config.hold_seconds,
+                rate_hz=hand_config.rate_hz,
+                hand=hand_config.hand,
+                domain_id=hand_config.domain_id,
+                network_interface=hand_config.interface,
+                command_topic=hand_config.command_topic,
+                state_topic=hand_config.state_topic,
+                state_timeout_seconds=hand_config.state_timeout_seconds,
+                allow_state_fallback=hand_config.allow_state_fallback,
+                live=hand_config.live,
+                print_state=hand_config.print_state,
+                return_to_open=hand_config.return_to_open,
+            )
+        )
+        return
+
+    mujoco = import_mujoco()
+    state = build_state(config)
+    playback = speak_countdown(state)
+
+    print("Opening Unitree G1 rock-paper-scissors demo...")
+    print("Speech: Rock, paper, scissors, shoot!")
+    if config.hand_hardware.enabled:
+        mode = (
+            "live DDS hand control"
+            if config.hand_hardware.live
+            else "dry-run DDS hand control"
+        )
+        print(f"Hand bridge: {mode} on {config.hand_hardware.hand} hand")
+        if config.hand_hardware.interface is not None:
+            print(f"DDS interface: {config.hand_hardware.interface}")
+    else:
+        print("Hand bridge: disabled")
+    print("Close the MuJoCo window to end the demo.")
+
+    try:
+        with mujoco.viewer.launch_passive(state.model, state.data) as viewer:
+            configure_camera(viewer)
+            begin_new_cycle(state, now=time.perf_counter())
+
+            while viewer.is_running():
+                now = time.perf_counter()
+                elapsed = now - state.cycle_started_at
+                current_cycle_duration = cycle_duration(config)
+
+                if elapsed >= current_cycle_duration:
+                    begin_new_cycle(state, now)
+                    elapsed = 0.0
+
+                pose = phase_pose(state, now, elapsed)
+                apply_pose(state.model, state.data, config, pose)
+                viewer.sync()
+                time.sleep(config.frame_dt)
+    except Exception as error:
+        error_trace = traceback.format_exc()
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LOG_PATH.write_text(error_trace)
+        if is_macos_mjpython_requirement(error):
+            print("Passive viewer is unavailable under plain `python` on macOS.")
+            print(
+                "For the passive viewer, run: source .venv/bin/activate && mjpython scripts/rorelse.py"
+            )
+            launch_blocking_fallback(state, playback)
+            return
+        if sys.platform == "darwin":
+            print(f"Passive viewer failed. Details saved to {LOG_PATH}")
+            launch_blocking_fallback(state, playback)
+            return
+        raise
+
+    playback.close()
+
+
+if __name__ == "__main__":
+    main()

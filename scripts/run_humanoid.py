@@ -1,4 +1,4 @@
-"""Run Humanoid-v5 with a random controller and print rewards."""
+"""Run the Unitree G1 MuJoCo scene with a random controller and print rewards."""
 
 from __future__ import annotations
 
@@ -13,10 +13,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from controllers.random_controller import sample_action
+from environments import UNITREE_G1_ENV_ID, register_environments
 
 
 def main() -> None:
-    env = gym.make("Humanoid-v5", render_mode="human")
+    register_environments()
+    env = gym.make(UNITREE_G1_ENV_ID, render_mode="human")
 
     _, _ = env.reset()
     episode_reward = 0.0

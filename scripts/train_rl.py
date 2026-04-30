@@ -4,18 +4,25 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 
 import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.evaluation import evaluate_policy
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from environments import UNITREE_G1_ENV_ID, register_environments
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO on a MuJoCo environment")
     parser.add_argument(
         "--env",
-        default="Hopper-v5",
-        help="Environment ID (e.g., Reacher-v5, Hopper-v5, Humanoid-v5)",
+        default=UNITREE_G1_ENV_ID,
+        help="Environment ID (e.g., Reacher-v5, Hopper-v5, UnitreeG1-v0)",
     )
     parser.add_argument(
         "--timesteps",
@@ -39,6 +46,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    register_environments()
 
     # 1) Create environment
     env = gym.make(args.env)

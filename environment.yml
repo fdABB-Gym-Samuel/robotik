@@ -9,5 +9,7 @@ dependencies:
   - pytorch
   - pip
   - pip:
+      - mujoco
       - gymnasium[mujoco]
       - stable-baselines3
+      - trimesh

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+venv_bin="$repo_root/.venv/bin"
+python_bin="$venv_bin/python"
+xml_path="$repo_root/assets/unitree_g1/g1_29dof_with_hand.xml"
+
+if [ ! -x "$python_bin" ]; then
+  echo "Expected Python at $python_bin" >&2
+  echo "Run ./scripts/setup-venv first so .venv is created." >&2
+  exit 1
+fi
+
+if [ ! -f "$xml_path" ]; then
+  echo "Expected Unitree G1 scene at $xml_path" >&2
+  exit 1
+fi
+
+cd "$repo_root"
+exec "$python_bin" -m mujoco.viewer --mjcf="$xml_path"
