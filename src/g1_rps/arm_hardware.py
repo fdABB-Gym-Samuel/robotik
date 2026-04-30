@@ -751,3 +751,73 @@ def run_pre_reveal_right_arm_hardware(config: ArmHardwareConfig) -> None:
         "Holding ready pose. Re-engage the high-level controller externally when finished."
     )
     session.hold(ready_pose, config.release_duration)
+
+
+# Celebration pose: both arms raised toward the ceiling. The gym Humanoid-v5
+# port in `scripts/humanoid_winning_pose.py` couldn't do this without the
+# unmoored humanoid falling over, so it ended up with all-zero arms. The G1's
+# legs are held externally (high-level controller / captured hold pose), so
+# raising both arms is safe.
+#
+# Shoulder pitch -3.05 rad rotates the upper arm ~175 deg about the joint's
+# pitch axis, just inside the URDF range [-3.0892, 2.6704].
+#
+# The G1 URDF has a 16 deg tilt baked into each shoulder_pitch_link (parent
+# quat is a rotation of +-16 deg about parent X). That means the pitch joint's
+# axis is not purely Y in the parent frame -- it's tilted 16 deg toward Z.
+# Rotating the arm ~180 deg about that tilted axis leaves the arm tilted
+# ~2*16 = ~32 deg toward the body's midline (inward). Adding a shoulder_roll
+# of +-0.56 rad rotates each arm back outward to true vertical. Sign convention
+# is +0.56 on the left and -0.56 on the right (mirrored).
+WINNING_SHOULDER_ROLL = 0.56
+
+# Elbow q=0 is already a heavy bend (~75 deg interior), not straight. The
+# `RIGHT_ELBOW_*` calibration points give interior_deg ~= 75 + 57.3 * q, so
+# q=1.7 corresponds to ~172 deg interior -- about 8 deg of flex from a fully
+# straight arm. That's the "little bend" the celebration pose calls for.
+WINNING_SHOULDER_PITCH = -3.05
+WINNING_ELBOW = 1.7
+
+
+def winning_pose(config: ArmHardwareConfig) -> dict[str, float]:
+    """Both-arms-up celebration pose covering all commanded arm joints.
+
+    Returns the 14 arm joints (7 left + 7 right for arm-7, or 10 for arm-5).
+    The legs and torso continue to be held at whatever positions the robot
+    was in when the hardware session opened; only the arms are driven.
+    """
+    pose = {
+        "left_shoulder_pitch_joint": WINNING_SHOULDER_PITCH,
+        "left_shoulder_roll_joint": WINNING_SHOULDER_ROLL,
+        "left_shoulder_yaw_joint": 0.0,
+        "left_elbow_joint": WINNING_ELBOW,
+        "left_wrist_roll_joint": 0.0,
+        "left_wrist_pitch_joint": 0.0,
+        "left_wrist_yaw_joint": 0.0,
+        "right_shoulder_pitch_joint": WINNING_SHOULDER_PITCH,
+        "right_shoulder_roll_joint": -WINNING_SHOULDER_ROLL,
+        "right_shoulder_yaw_joint": 0.0,
+        "right_elbow_joint": WINNING_ELBOW,
+        "right_wrist_roll_joint": 0.0,
+        "right_wrist_pitch_joint": 0.0,
+        "right_wrist_yaw_joint": 0.0,
+    }
+    upper_body = commanded_upper_body_joints(config)
+    return {name: pose[name] for name in pose if name in upper_body}
+
+
+def run_winning_pose_hardware(config: ArmHardwareConfig) -> None:
+    target_pose = winning_pose(config)
+
+    if not config.live and not config.print_state:
+        print("Dry run only. No real robot commands were sent.")
+        print("Planned winning pose:")
+        for joint_name, value in target_pose.items():
+            print(f"  {joint_name}: {value:+.3f}")
+        return
+
+    raise RuntimeError(
+        "Live and print-state execution requires the C++ Unitree SDK backend invoked from "
+        "scripts/winning_pose_hardware.py. The Python DDS fallback is not implemented "
+        "for the winning-pose script."
+    )

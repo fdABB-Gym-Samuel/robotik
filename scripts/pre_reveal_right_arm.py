@@ -15,6 +15,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from xml.etree import ElementTree
 
 
 _nullcontext = contextlib.nullcontext
@@ -209,7 +210,7 @@ class SimulatorArmInterface(JointInterface):
     """Simulator-side implementation with joint-limit safety clamps."""
 
     def __init__(self, xml_path: Path, control_dt: float) -> None:
-        self._mujoco = import_mujoco()
+        self._mujoco = mujoco
         if not xml_path.exists():
             raise SystemExit(f"Unitree G1 scene not found: {xml_path}")
         runtime_scene = ensure_runtime_scene(xml_path)
@@ -352,7 +353,6 @@ def run_pre_reveal_motion(robot: JointInterface, params: MotionParameters) -> No
 
 
 def ensure_runtime_scene(scene_path: Path) -> Path:
-    trimesh = import_trimesh()
     runtime_path = RUNTIME_SCENE_PATH
     runtime_path.parent.mkdir(parents=True, exist_ok=True)
 

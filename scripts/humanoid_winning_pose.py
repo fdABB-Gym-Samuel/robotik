@@ -8,7 +8,7 @@ from pathlib import Path
 import gymnasium as gym
 import numpy as np
 
-# Make project-root imports work when running: python scripts/Hardcoded.py
+# Make project-root imports work when running: python scripts/humanoid_winning_pose.py
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
