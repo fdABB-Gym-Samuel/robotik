@@ -21,8 +21,13 @@ import math
 import os
 import socket
 import time
+from importlib import metadata
 from dataclasses import dataclass
 from typing import Any
+
+from .unitree_sdk2_config import (
+    configure_local_cyclonedds_log,
+)
 
 
 class G1JointIndex:
@@ -63,7 +68,10 @@ class ArmHardwareConfig:
     domain_id: int = 0
     live: bool = False
     print_state: bool = False
+    auto_release_mode: bool = True
     state_timeout_seconds: float = 5.0
+    motion_switch_timeout_seconds: float = 5.0
+    motion_switch_poll_interval: float = 0.5
     control_dt: float = 0.005
     setup_duration: float = 0.8
     beat_duration: float = 0.5
@@ -74,8 +82,12 @@ class ArmHardwareConfig:
     kd: float = 1.5
     hold_kp: float = 60.0
     hold_kd: float = 1.5
-    arm_amplitude: float = 0.18
+    arm_amplitude: float = 0.02
     wrist_angle: float = -0.18
+
+
+RIGHT_ELBOW_90_DEG_Q = 0.262
+RIGHT_ELBOW_125_DEG_Q = 0.873
 
 
 def clamp_unit(value: float) -> float:
@@ -110,10 +122,10 @@ def add_joint_deltas(
 
 def ready_right_arm_pose(config: ArmHardwareConfig) -> dict[str, float]:
     return {
-        "right_shoulder_pitch_joint": -0.42,
-        "right_shoulder_roll_joint": -0.62,
-        "right_shoulder_yaw_joint": 0.18,
-        "right_elbow_joint": 1.18,
+        "right_shoulder_pitch_joint": -0.785,
+        "right_shoulder_roll_joint": 0.0,
+        "right_shoulder_yaw_joint": 0.0,
+        "right_elbow_joint": RIGHT_ELBOW_90_DEG_Q,
         "right_wrist_roll_joint": -0.08,
         "right_wrist_pitch_joint": config.wrist_angle,
         "right_wrist_yaw_joint": -0.16,
@@ -159,16 +171,33 @@ def wsl_network_warning(interface_ip: str | None) -> list[str]:
     return []
 
 
+def cyclonedds_version_warning() -> list[str]:
+    try:
+        version = metadata.version("cyclonedds")
+    except metadata.PackageNotFoundError:
+        return []
+    except Exception:
+        return []
+
+    if version.startswith("0.10."):
+        return []
+
+    return [
+        f"Installed Python `cyclonedds` version: {version}.",
+        "Unitree's `unitree_sdk2_python` README expects `cyclonedds == 0.10.2`.",
+        "This repo's Nix environment currently swaps that dependency to `11.0.1`, which may prevent `rt/lowstate` discovery or decoding.",
+    ]
+
+
 def beat_arm_offset(
     config: ArmHardwareConfig, local_time: float, beat_index: int
 ) -> dict[str, float]:
     normalized = clamp_unit(local_time / config.beat_duration)
-    downbeat = math.exp(-18.0 * normalized) if normalized > 0.0 else 1.0
-    rebound = math.sin(math.pi * normalized)
+    extension = math.sin(math.pi * normalized)
 
-    shoulder_pitch = -config.arm_amplitude * (0.95 * downbeat - 0.2 * rebound)
-    elbow = 0.36 * downbeat - 0.08 * rebound
-    wrist_pitch = 0.1 * downbeat
+    shoulder_pitch = config.arm_amplitude * extension
+    elbow = (RIGHT_ELBOW_125_DEG_Q - RIGHT_ELBOW_90_DEG_Q) * extension
+    wrist_pitch = 0.04 * extension
     wrist_roll = -0.03 * beat_index
 
     return {
@@ -190,6 +219,10 @@ class UnitreeLowCmdSession:
 
     def __init__(self, config: ArmHardwareConfig) -> None:
         try:
+            from cyclonedds.sub import DataReader
+            from cyclonedds.topic import Topic
+            from cyclonedds.util import duration as dds_duration
+            from unitree_sdk2py.core.channel import ChannelFactory
             from unitree_sdk2py.core.channel import ChannelFactoryInitialize
             from unitree_sdk2py.core.channel import ChannelPublisher
             from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -197,12 +230,14 @@ class UnitreeLowCmdSession:
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
             from unitree_sdk2py.utils.crc import CRC
-        except ModuleNotFoundError as exc:
+        except (ModuleNotFoundError, ImportError) as exc:
             raise SystemExit(
                 "Real G1 arm control requires Unitree's official `unitree_sdk2py` package. "
                 "Install it on the robot or control PC first, following "
                 "https://github.com/unitreerobotics/unitree_sdk2_python"
             ) from exc
+
+        log_path = configure_local_cyclonedds_log()
 
         if config.interface is not None:
             ChannelFactoryInitialize(config.domain_id, config.interface)
@@ -211,21 +246,115 @@ class UnitreeLowCmdSession:
 
         self._config = config
         self._low_state: Any | None = None
+        self._last_lowstate_error: Exception | None = None
         self._crc = CRC()
         self._low_cmd_factory = unitree_hg_msg_dds__LowCmd_
+        self._maybe_release_high_level_mode()
+        self._channel_factory = ChannelFactory()
+        self._lowstate_participant = getattr(
+            self._channel_factory,
+            "_ChannelFactory__participant",
+            None,
+        )
+        if self._lowstate_participant is None:
+            raise RuntimeError(
+                "Unitree ChannelFactory did not expose an initialized DDS participant."
+            )
+        self._lowstate_topic = Topic(
+            self._lowstate_participant,
+            "rt/lowstate",
+            LowState_,
+        )
+        self._lowstate_reader = DataReader(
+            self._lowstate_participant,
+            self._lowstate_topic,
+        )
+        self._dds_duration = dds_duration
         self._publisher = ChannelPublisher("rt/lowcmd", LowCmd_)
         self._publisher.Init()
         self._subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self._subscriber.Init(self._low_state_handler, 10)
         self._right_arm_indices = set(RIGHT_ARM_JOINTS.values())
         self._hold_q: list[float] = [0.0] * NUM_G1_MOTORS
+        self._cyclonedds_log_path = log_path
 
     def _low_state_handler(self, msg: Any) -> None:
         self._low_state = msg
 
+    def _take_lowstate_sample(self) -> Any | None:
+        try:
+            polled_state = self._lowstate_reader.take_one(
+                timeout=self._dds_duration(seconds=0.2)
+            )
+        except (TimeoutError, StopIteration):
+            return None
+        except Exception as exc:
+            self._last_lowstate_error = exc
+            raise RuntimeError(
+                "Failed while reading `rt/lowstate` with the direct CycloneDDS "
+                f"reader: {exc}"
+            ) from exc
+
+        if polled_state.__class__.__name__ == "InvalidSample":
+            return None
+        return polled_state
+
+    def _maybe_release_high_level_mode(self) -> None:
+        if not self._config.auto_release_mode:
+            return
+
+        try:
+            from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
+                MotionSwitcherClient,
+            )
+        except ModuleNotFoundError:
+            print(
+                "MotionSwitcherClient is unavailable in this Unitree SDK build. "
+                "If the robot is still in a high-level arm mode, release it manually "
+                "before running low-level arm control."
+            )
+            return
+
+        client = MotionSwitcherClient()
+        client.SetTimeout(self._config.motion_switch_timeout_seconds)
+        client.Init()
+
+        deadline = time.perf_counter() + self._config.motion_switch_timeout_seconds
+        while time.perf_counter() < deadline:
+            status, result = client.CheckMode()
+            if status != 0 or result is None:
+                print(
+                    "MotionSwitcherClient.CheckMode did not respond. "
+                    "Skipping automatic high-level mode release; release manually "
+                    "with L2+B then L2+R2 before low-level arm control."
+                )
+                return
+            if not result.get("name"):
+                return
+
+            release_status, _ = client.ReleaseMode()
+            if release_status != 0:
+                print(
+                    "MotionSwitcherClient.ReleaseMode did not respond. "
+                    "Skipping automatic high-level mode release; release manually "
+                    "with L2+B then L2+R2 before low-level arm control."
+                )
+                return
+            time.sleep(self._config.motion_switch_poll_interval)
+
+        print(
+            "Timed out while asking MotionSwitcherClient to release the high-level mode. "
+            "Continuing anyway, but low-level arm control may not receive state or may "
+            "fight the existing controller."
+        )
+
     def wait_for_state(self) -> Any:
         deadline = time.perf_counter() + self._config.state_timeout_seconds
         while self._low_state is None and time.perf_counter() < deadline:
+            polled_state = self._take_lowstate_sample()
+            if polled_state is not None:
+                self._low_state = polled_state
+                break
             time.sleep(0.05)
         if self._low_state is None:
             interface = self._config.interface
@@ -234,18 +363,30 @@ class UnitreeLowCmdSession:
                 "No `rt/lowstate` sample was received for the real G1 arm controller.",
                 f"DDS domain ID: {self._config.domain_id}",
                 f"DDS interface: {interface or 'auto'}",
+                f"CycloneDDS log: {self._cyclonedds_log_path}",
             ]
             if interface_ip is not None:
                 diagnostic_lines.append(f"Interface IPv4: {interface_ip}")
+            if self._config.domain_id != 0:
+                diagnostic_lines.append(
+                    "Unitree examples usually use DDS domain ID 0; retry with "
+                    "`--domain-id 0` unless this robot was configured differently."
+                )
+            if self._last_lowstate_error is not None:
+                diagnostic_lines.append(
+                    f"Last direct reader error: {self._last_lowstate_error}"
+                )
             diagnostic_lines.extend(wsl_network_warning(interface_ip))
+            diagnostic_lines.extend(cyclonedds_version_warning())
             diagnostic_lines.extend(
                 [
                     "Check that the robot is physically reachable on the same subnet,",
                     "that the chosen interface is the real robot-facing NIC,",
+                    "that the high-level controller has been released,",
                     "and that the robot is publishing `rt/lowstate`.",
                 ]
             )
-            raise RuntimeError(" ".join(diagnostic_lines))
+            raise RuntimeError("\n".join(diagnostic_lines))
         return self._low_state
 
     def capture_hold_pose(self) -> None:
