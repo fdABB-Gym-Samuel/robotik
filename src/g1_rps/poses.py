@@ -76,7 +76,9 @@ class DemoConfig:
     asset_dir: str | None = None
 
 
-def build_hand_pose(gesture: str, joint_ranges: dict[str, tuple[float, float]]) -> dict[str, float]:
+def build_hand_pose(
+    gesture: str, joint_ranges: dict[str, tuple[float, float]]
+) -> dict[str, float]:
     try:
         gesture_ratios = HAND_GESTURE_RATIOS[gesture]
     except KeyError as exc:

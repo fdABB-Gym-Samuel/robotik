@@ -1,4 +1,19 @@
-"""Real Unitree G1 right-arm pre-reveal motion over the official arm DDS path."""
+"""Real Unitree G1 right-arm pre-reveal motion over the low-level `rt/lowcmd` path.
+
+This module previously used `rt/arm_sdk`, but on this robot that topic is gated
+by the high-level arm service and our commands were silently dropped. We now
+publish on `rt/lowcmd` directly, which requires:
+
+* The high-level controller must be released first (hold L2+B then L2+R2 on the
+  Unitree controller, or call `MotionSwitcherClient.SelectMode("")`). Otherwise
+  the high-level controller will fight our commands.
+* `mode_machine` from the latest `rt/lowstate` must be copied into every
+  `LowCmd_` we publish. The robot rejects commands that do not match.
+* Every motor (0..28) must be commanded each cycle. The non-arm joints are held
+  at the position they had when the session opened, so the legs and torso stay
+  put. If the robot is not suspended, expect it to be bearing weight on its
+  legs the whole time, so make sure it is on a stand or the user is holding it.
+"""
 
 from __future__ import annotations
 
@@ -39,6 +54,9 @@ RIGHT_ARM_JOINTS = {
 }
 
 
+NUM_G1_MOTORS = 29
+
+
 @dataclass(frozen=True)
 class ArmHardwareConfig:
     interface: str | None = None
@@ -46,7 +64,7 @@ class ArmHardwareConfig:
     live: bool = False
     print_state: bool = False
     state_timeout_seconds: float = 5.0
-    control_dt: float = 0.02
+    control_dt: float = 0.005
     setup_duration: float = 0.8
     beat_duration: float = 0.5
     beat_count: int = 3
@@ -54,6 +72,8 @@ class ArmHardwareConfig:
     release_duration: float = 0.6
     kp: float = 60.0
     kd: float = 1.5
+    hold_kp: float = 60.0
+    hold_kd: float = 1.5
     arm_amplitude: float = 0.18
     wrist_angle: float = -0.18
 
@@ -69,7 +89,9 @@ def ease_in_out_cubic(alpha: float) -> float:
     return 1.0 - pow(-2.0 * alpha + 2.0, 3.0) / 2.0
 
 
-def blend_pose(start: dict[str, float], target: dict[str, float], alpha: float) -> dict[str, float]:
+def blend_pose(
+    start: dict[str, float], target: dict[str, float], alpha: float
+) -> dict[str, float]:
     alpha = clamp_unit(alpha)
     return {
         joint_name: (1.0 - alpha) * start[joint_name] + alpha * target[joint_name]
@@ -77,7 +99,9 @@ def blend_pose(start: dict[str, float], target: dict[str, float], alpha: float) 
     }
 
 
-def add_joint_deltas(base_pose: dict[str, float], deltas: dict[str, float]) -> dict[str, float]:
+def add_joint_deltas(
+    base_pose: dict[str, float], deltas: dict[str, float]
+) -> dict[str, float]:
     updated_pose = dict(base_pose)
     for joint_name, delta in deltas.items():
         updated_pose[joint_name] = updated_pose.get(joint_name, 0.0) + delta
@@ -135,7 +159,9 @@ def wsl_network_warning(interface_ip: str | None) -> list[str]:
     return []
 
 
-def beat_arm_offset(config: ArmHardwareConfig, local_time: float, beat_index: int) -> dict[str, float]:
+def beat_arm_offset(
+    config: ArmHardwareConfig, local_time: float, beat_index: int
+) -> dict[str, float]:
     normalized = clamp_unit(local_time / config.beat_duration)
     downbeat = math.exp(-18.0 * normalized) if normalized > 0.0 else 1.0
     rebound = math.sin(math.pi * normalized)
@@ -153,7 +179,15 @@ def beat_arm_offset(config: ArmHardwareConfig, local_time: float, beat_index: in
     }
 
 
-class UnitreeArmSdkSession:
+class UnitreeLowCmdSession:
+    """Low-level controller for the right arm using `rt/lowcmd`.
+
+    All 29 G1 joints are commanded every cycle. The 7 right-arm joints follow
+    the requested pose; the remaining 22 joints are held at the position they
+    had when the session opened. The robot's `mode_machine` is mirrored back
+    on every command, which the firmware requires.
+    """
+
     def __init__(self, config: ArmHardwareConfig) -> None:
         try:
             from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -179,10 +213,12 @@ class UnitreeArmSdkSession:
         self._low_state: Any | None = None
         self._crc = CRC()
         self._low_cmd_factory = unitree_hg_msg_dds__LowCmd_
-        self._publisher = ChannelPublisher("rt/arm_sdk", LowCmd_)
+        self._publisher = ChannelPublisher("rt/lowcmd", LowCmd_)
         self._publisher.Init()
         self._subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self._subscriber.Init(self._low_state_handler, 10)
+        self._right_arm_indices = set(RIGHT_ARM_JOINTS.values())
+        self._hold_q: list[float] = [0.0] * NUM_G1_MOTORS
 
     def _low_state_handler(self, msg: Any) -> None:
         self._low_state = msg
@@ -209,10 +245,13 @@ class UnitreeArmSdkSession:
                     "and that the robot is publishing `rt/lowstate`.",
                 ]
             )
-            raise RuntimeError(
-                " ".join(diagnostic_lines)
-            )
+            raise RuntimeError(" ".join(diagnostic_lines))
         return self._low_state
+
+    def capture_hold_pose(self) -> None:
+        """Snapshot every joint's current position so non-arm joints can be held in place."""
+        state = self.wait_for_state()
+        self._hold_q = [float(state.motor_state[i].q) for i in range(NUM_G1_MOTORS)]
 
     def current_right_arm_pose(self) -> dict[str, float]:
         state = self.wait_for_state()
@@ -221,40 +260,75 @@ class UnitreeArmSdkSession:
             pose[joint_name] = float(state.motor_state[joint_index].q)
         return pose
 
-    def publish_pose(self, pose: dict[str, float], enable_arm_sdk: float = 1.0) -> None:
+    def publish_pose(self, pose: dict[str, float]) -> None:
         low_cmd = self._low_cmd_factory()
-        low_cmd.motor_cmd[G1JointIndex.kNotUsedJoint].q = enable_arm_sdk
+
+        # `mode_pr` selects the ankle parameterization (0 = PR / pitch-roll,
+        # the default for G1). `mode_machine` is a token published by the
+        # robot's firmware on `rt/lowstate`; the robot will reject a LowCmd
+        # that does not echo the current value.
+        low_cmd.mode_pr = 0
+        if self._low_state is not None:
+            low_cmd.mode_machine = self._low_state.mode_machine
+
+        for joint_index in range(NUM_G1_MOTORS):
+            motor_cmd = low_cmd.motor_cmd[joint_index]
+            motor_cmd.mode = 1  # 1 = enable PD control on the joint
+            motor_cmd.tau = 0.0
+            motor_cmd.dq = 0.0
+            motor_cmd.q = self._hold_q[joint_index]
+            if joint_index in self._right_arm_indices:
+                motor_cmd.kp = self._config.kp
+                motor_cmd.kd = self._config.kd
+            else:
+                motor_cmd.kp = self._config.hold_kp
+                motor_cmd.kd = self._config.hold_kd
+
         for joint_name, target in pose.items():
             joint_index = RIGHT_ARM_JOINTS[joint_name]
-            motor_cmd = low_cmd.motor_cmd[joint_index]
-            motor_cmd.tau = 0.0
-            motor_cmd.q = float(target)
-            motor_cmd.dq = 0.0
-            motor_cmd.kp = self._config.kp
-            motor_cmd.kd = self._config.kd
+            low_cmd.motor_cmd[joint_index].q = float(target)
+
         low_cmd.crc = self._crc.Crc(low_cmd)
         self._publisher.Write(low_cmd)
 
-    def interpolate(self, start_pose: dict[str, float], target_pose: dict[str, float], duration: float) -> None:
+    def interpolate(
+        self,
+        start_pose: dict[str, float],
+        target_pose: dict[str, float],
+        duration: float,
+    ) -> None:
         steps = max(1, int(duration / self._config.control_dt))
         for step in range(1, steps + 1):
             alpha = ease_in_out_cubic(step / steps)
             pose = blend_pose(start_pose, target_pose, alpha)
             if self._config.live:
-                self.publish_pose(pose, enable_arm_sdk=1.0)
+                self.publish_pose(pose)
             time.sleep(self._config.control_dt)
 
-    def release(self, pose: dict[str, float]) -> None:
-        steps = max(1, int(self._config.release_duration / self._config.control_dt))
-        for step in range(steps + 1):
-            alpha = step / steps
-            enable_arm_sdk = 1.0 - alpha
+    def hold(self, pose: dict[str, float], duration: float) -> None:
+        """Keep publishing the same arm pose for `duration` seconds.
+
+        Unlike the old `arm_sdk` release, low-level mode has no way to gracefully
+        hand control back. The high-level controller has to be re-engaged
+        externally (L2+R2 on the controller, or `MotionSwitcherClient`).
+        """
+        steps = max(1, int(duration / self._config.control_dt))
+        for _ in range(steps):
             if self._config.live:
-                self.publish_pose(pose, enable_arm_sdk=enable_arm_sdk)
+                self.publish_pose(pose)
             time.sleep(self._config.control_dt)
 
 
-def _phase_pose(config: ArmHardwareConfig, ready_pose: dict[str, float], beat_index: int, local_time: float) -> dict[str, float]:
+# Backwards-compat alias so older imports of `UnitreeArmSdkSession` keep working.
+UnitreeArmSdkSession = UnitreeLowCmdSession
+
+
+def _phase_pose(
+    config: ArmHardwareConfig,
+    ready_pose: dict[str, float],
+    beat_index: int,
+    local_time: float,
+) -> dict[str, float]:
     return add_joint_deltas(ready_pose, beat_arm_offset(config, local_time, beat_index))
 
 
@@ -268,7 +342,8 @@ def run_pre_reveal_right_arm_hardware(config: ArmHardwareConfig) -> None:
             print(f"  {joint_name}: {value:+.3f}")
         return
 
-    session = UnitreeArmSdkSession(config)
+    session = UnitreeLowCmdSession(config)
+    session.capture_hold_pose()
     start_pose = session.current_right_arm_pose()
 
     if config.print_state:
@@ -280,6 +355,11 @@ def run_pre_reveal_right_arm_hardware(config: ArmHardwareConfig) -> None:
         print("Dry run only. No real robot commands were sent.")
         return
 
+    print(
+        "Sending `rt/lowcmd`. Make sure the high-level controller is released "
+        '(L2+B then L2+R2 on the controller, or MotionSwitcherClient.SelectMode("")) '
+        "before this point, otherwise the high-level controller will fight these commands."
+    )
     print("Moving real G1 right arm into the concealed ready pose...")
     session.interpolate(start_pose, ready_pose, config.setup_duration)
 
@@ -289,10 +369,16 @@ def run_pre_reveal_right_arm_hardware(config: ArmHardwareConfig) -> None:
         for step in range(steps):
             local_time = step * config.control_dt
             pose = _phase_pose(config, ready_pose, beat_index, local_time)
-            session.publish_pose(pose, enable_arm_sdk=1.0)
+            session.publish_pose(pose)
             time.sleep(config.control_dt)
 
     print("Returning the real G1 right arm to the concealed ready pose...")
-    session.interpolate(_phase_pose(config, ready_pose, config.beat_count - 1, config.beat_duration), ready_pose, config.return_duration)
-    print("Releasing arm_sdk control...")
-    session.release(ready_pose)
+    session.interpolate(
+        _phase_pose(config, ready_pose, config.beat_count - 1, config.beat_duration),
+        ready_pose,
+        config.return_duration,
+    )
+    print(
+        "Holding ready pose. Re-engage the high-level controller externally when finished."
+    )
+    session.hold(ready_pose, config.release_duration)

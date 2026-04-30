@@ -40,7 +40,9 @@ class HardwareConfig:
     allow_state_fallback: bool = False
 
 
-def build_hardware_channels(gesture: str) -> tuple[float, float, float, float, float, float]:
+def build_hardware_channels(
+    gesture: str,
+) -> tuple[float, float, float, float, float, float]:
     """Map the simulation gesture definition onto Unitree's 6-channel hand control.
 
     Unitree's official Inspire hand controller uses one normalized `q` value per:
@@ -142,7 +144,9 @@ def _create_dds_session(config: HardwareConfig):
         ) from exc
 
 
-def _initial_channels_from_state(session, config: HardwareConfig) -> tuple[float, ...] | None:
+def _initial_channels_from_state(
+    session, config: HardwareConfig
+) -> tuple[float, ...] | None:
     state = session.read_state(timeout_seconds=config.state_timeout_seconds)
     if state is None or len(state.states) < 12:
         return None
@@ -154,7 +158,9 @@ def _require_initial_state(session, config: HardwareConfig):
     if state is not None:
         return state
     if config.allow_state_fallback:
-        print("Warning: no initial Inspire hand state received, falling back to a synthetic open-state baseline.")
+        print(
+            "Warning: no initial Inspire hand state received, falling back to a synthetic open-state baseline."
+        )
         return _synthetic_open_state()
     raise RuntimeError(
         "No valid initial Inspire hand state was received. "
@@ -163,7 +169,9 @@ def _require_initial_state(session, config: HardwareConfig):
     )
 
 
-def extract_hand_channels_from_state(state, hand: str) -> tuple[float, float, float, float, float, float]:
+def extract_hand_channels_from_state(
+    state, hand: str
+) -> tuple[float, float, float, float, float, float]:
     offset = HAND_SLOT_OFFSETS[hand]
     return tuple(_clamp01(float(state.states[offset + index].q)) for index in range(6))
 
@@ -200,7 +208,12 @@ def _hold_target(
         if config.print_state:
             state = session.read_state(timeout_seconds=0.0)
             if state is not None and len(state.states) >= 12:
-                print("  state:", _format_channels(extract_hand_channels_from_state(state, config.hand)))
+                print(
+                    "  state:",
+                    _format_channels(
+                        extract_hand_channels_from_state(state, config.hand)
+                    ),
+                )
         time.sleep(sleep_seconds)
 
 
@@ -227,7 +240,9 @@ def build_motor_commands(
 def _print_dry_run(sequence: tuple[str, ...], hand: str) -> None:
     print("Dry-run only. Use `--live` to actually publish DDS commands to the robot.")
     for gesture in sequence:
-        print(f"{gesture:>8}: {_format_channels(build_hardware_channels(gesture))} -> hand={hand}")
+        print(
+            f"{gesture:>8}: {_format_channels(build_hardware_channels(gesture))} -> hand={hand}"
+        )
 
 
 def _invert_average(*values: float) -> float:
@@ -245,5 +260,7 @@ def _synthetic_open_state():
 
 
 def _format_channels(channels: tuple[float, ...]) -> str:
-    pieces = [f"{name}={value:.2f}" for name, value in zip(RIGHT_HAND_CHANNEL_ORDER, channels)]
+    pieces = [
+        f"{name}={value:.2f}" for name, value in zip(RIGHT_HAND_CHANNEL_ORDER, channels)
+    ]
     return ", ".join(pieces)

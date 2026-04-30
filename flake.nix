@@ -137,7 +137,15 @@
           };
         in
         {
-          inherit cycloneddsPy g1ArmHardware g1Demo g1HandHardware pythonEnv richClickPy unitreeSdk2Py;
+          inherit
+            cycloneddsPy
+            g1ArmHardware
+            g1Demo
+            g1HandHardware
+            pythonEnv
+            richClickPy
+            unitreeSdk2Py
+            ;
         };
     in
     {
