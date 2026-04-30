@@ -133,6 +133,7 @@
               py.protobuf
               py.sounddevice
             ];
+            pythonRemoveDeps = [ "opencv-contrib-python" ];
             pythonImportsCheck = [ "mediapipe" ];
             doCheck = false;
           };
