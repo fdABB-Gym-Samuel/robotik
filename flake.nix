@@ -26,6 +26,13 @@
           python = pkgs.python312;
           py = pkgs.python312Packages;
 
+          # nixpkgs builds opencv4 with GUI disabled by default, so cv2.imshow
+          # is a no-op. Enable GTK3 so --display works on Ubuntu/GNOME.
+          opencvPy = py.opencv4.override {
+            enableGtk3 = true;
+            enableContrib = true;
+          };
+
           richClickPy = py.buildPythonPackage rec {
             pname = "rich-click";
             version = "1.9.7";
@@ -122,7 +129,7 @@
               py.flatbuffers
               py.matplotlib
               py.numpy
-              py."opencv-contrib-python"
+              opencvPy
               py.protobuf
               py.sounddevice
             ];
@@ -138,7 +145,7 @@
               numpy
               matplotlib
               mujoco
-              opencv-contrib-python
+              opencvPy
               imageio
               trimesh
               glfw
@@ -230,6 +237,8 @@
               mesa
               libX11
               libXext
+              gtk3
+              glib
               project.pythonEnv
               project.g1Demo
               project.g1HandHardware
