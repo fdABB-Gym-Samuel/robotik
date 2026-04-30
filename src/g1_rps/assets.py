@@ -23,12 +23,16 @@ def default_asset_checkout() -> Path:
 def ensure_unitree_g1_assets(asset_root: Path | None = None) -> Path:
     """Ensure the official Unitree Inspire hand assets are available locally."""
     checkout_dir = Path(
-        asset_root
-        or os.environ.get("UNITREE_G1_ASSET_DIR")
-        or default_asset_checkout()
+        asset_root or os.environ.get("UNITREE_G1_ASSET_DIR") or default_asset_checkout()
     )
     hand_urdf_path = checkout_dir / HAND_URDF_RELATIVE_PATH
-    runtime_model_path = checkout_dir / "robots" / "g1_description" / "inspire_hand" / "FTP_right_hand_runtime.xml"
+    runtime_model_path = (
+        checkout_dir
+        / "robots"
+        / "g1_description"
+        / "inspire_hand"
+        / "FTP_right_hand_runtime.xml"
+    )
 
     if hand_urdf_path.exists():
         return _prepare_hand_runtime_model(hand_urdf_path, runtime_model_path)
@@ -48,7 +52,9 @@ def ensure_unitree_g1_assets(asset_root: Path | None = None) -> Path:
                 str(checkout_dir),
             ]
         )
-        _run(["git", "sparse-checkout", "set", "robots/g1_description"], cwd=checkout_dir)
+        _run(
+            ["git", "sparse-checkout", "set", "robots/g1_description"], cwd=checkout_dir
+        )
     else:
         _run(["git", "pull", "--ff-only"], cwd=checkout_dir)
 
@@ -62,7 +68,10 @@ def ensure_unitree_g1_assets(asset_root: Path | None = None) -> Path:
 
 
 def _prepare_hand_runtime_model(hand_urdf_path: Path, runtime_model_path: Path) -> Path:
-    if runtime_model_path.exists() and runtime_model_path.stat().st_mtime >= hand_urdf_path.stat().st_mtime:
+    if (
+        runtime_model_path.exists()
+        and runtime_model_path.stat().st_mtime >= hand_urdf_path.stat().st_mtime
+    ):
         return runtime_model_path
 
     robot_root = ElementTree.parse(hand_urdf_path).getroot()
@@ -82,15 +91,21 @@ def _prepare_hand_runtime_model(hand_urdf_path: Path, runtime_model_path: Path) 
 
     mujoco_root = ElementTree.Element("mujoco", {"model": "unitree_inspire_right_hand"})
     ElementTree.SubElement(mujoco_root, "compiler", {"angle": "radian"})
-    option = ElementTree.SubElement(mujoco_root, "option", {"gravity": "0 0 0", "timestep": "0.005"})
+    option = ElementTree.SubElement(
+        mujoco_root, "option", {"gravity": "0 0 0", "timestep": "0.005"}
+    )
     option.set("integrator", "implicitfast")
 
     asset = ElementTree.SubElement(mujoco_root, "asset")
     _add_mesh_assets(asset, links, model_dir)
 
     worldbody = ElementTree.SubElement(mujoco_root, "worldbody")
-    ElementTree.SubElement(worldbody, "light", {"pos": "0 0 1.4", "dir": "0 0 -1", "directional": "true"})
-    base_body = ElementTree.SubElement(worldbody, "body", {"name": root_link_name, "pos": "0 0 0"})
+    ElementTree.SubElement(
+        worldbody, "light", {"pos": "0 0 1.4", "dir": "0 0 -1", "directional": "true"}
+    )
+    base_body = ElementTree.SubElement(
+        worldbody, "body", {"name": root_link_name, "pos": "0 0 0"}
+    )
     ElementTree.SubElement(
         base_body,
         "freejoint",
@@ -104,14 +119,22 @@ def _prepare_hand_runtime_model(hand_urdf_path: Path, runtime_model_path: Path) 
         if joint.get("type") == "revolute":
             name = joint.get("name")
             ctrlrange = _ctrlrange(joint)
-            ElementTree.SubElement(actuator, "position", {"name": name, "joint": name, "kp": "10", "ctrlrange": ctrlrange})
+            ElementTree.SubElement(
+                actuator,
+                "position",
+                {"name": name, "joint": name, "kp": "10", "ctrlrange": ctrlrange},
+            )
 
     runtime_model_path.parent.mkdir(parents=True, exist_ok=True)
-    ElementTree.ElementTree(mujoco_root).write(runtime_model_path, encoding="utf-8", xml_declaration=False)
+    ElementTree.ElementTree(mujoco_root).write(
+        runtime_model_path, encoding="utf-8", xml_declaration=False
+    )
     return runtime_model_path
 
 
-def _add_mesh_assets(asset: ElementTree.Element, links: dict[str, ElementTree.Element], model_dir: Path) -> None:
+def _add_mesh_assets(
+    asset: ElementTree.Element, links: dict[str, ElementTree.Element], model_dir: Path
+) -> None:
     trimesh = _import_trimesh()
     seen: set[str] = set()
     for link_name, link in links.items():
@@ -133,7 +156,9 @@ def _add_mesh_assets(asset: ElementTree.Element, links: dict[str, ElementTree.El
             vertices = getattr(mesh, "vertices", None)
             faces = getattr(mesh, "faces", None)
             if vertices is None or faces is None:
-                raise RuntimeError(f"Could not extract triangle mesh data from {mesh_path}")
+                raise RuntimeError(
+                    f"Could not extract triangle mesh data from {mesh_path}"
+                )
             ElementTree.SubElement(
                 asset,
                 "mesh",
@@ -176,7 +201,9 @@ def _build_body_tree(
         _build_body_tree(child_body, child_link_name, links, children_by_parent)
 
 
-def _populate_link_body(body: ElementTree.Element, link: ElementTree.Element, mesh_prefix: str) -> None:
+def _populate_link_body(
+    body: ElementTree.Element, link: ElementTree.Element, mesh_prefix: str
+) -> None:
     for visual in link.findall("visual"):
         mesh_elem = visual.find("./geometry/mesh")
         if mesh_elem is None:
@@ -271,7 +298,9 @@ def _resolve_mesh_path(model_dir: Path, filename: str) -> Path:
     for candidate in candidates:
         if candidate.exists():
             return candidate
-    raise FileNotFoundError(f"Could not resolve Unitree hand mesh path for '{filename}'")
+    raise FileNotFoundError(
+        f"Could not resolve Unitree hand mesh path for '{filename}'"
+    )
 
 
 def _import_trimesh():

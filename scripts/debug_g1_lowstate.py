@@ -14,7 +14,7 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
     if candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
 
-from g1_rps.arm_hardware import _configure_unitree_sdk_trace_output, _validate_requested_interface
+from g1_rps.unitree_sdk2_config import configure_local_cyclonedds_log
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +47,8 @@ def main() -> None:
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
     from unitree_sdk2py.core.channel import ChannelSubscriber
     from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+
+    configure_local_cyclonedds_log()
 
     received: dict[str, object] = {"sample": None, "count": 0}
 

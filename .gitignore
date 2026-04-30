@@ -216,5 +216,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 runs/logs/*
+runs/bin/
 runs/videos/*
 runs/assets/

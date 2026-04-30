@@ -6,7 +6,7 @@ executes the final shoot thrust and never reveals rock, paper, or scissors.
 
 from __future__ import annotations
 
-import argparse
+import contextlib
 import math
 import sys
 import threading
@@ -14,50 +14,47 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
-from xml.etree import ElementTree
+from typing import Protocol
 
-if TYPE_CHECKING:
+
+_nullcontext = contextlib.nullcontext
+
+try:
     import mujoco
+    import mujoco.viewer
+except ModuleNotFoundError as exc:  # pragma: no cover - local setup guard
+    raise SystemExit(
+        "MuJoCo Python bindings are not installed. Enter `nix develop` first "
+        "before running this script."
+    ) from exc
+
+try:
+    import trimesh
+except ModuleNotFoundError as exc:  # pragma: no cover - local setup guard
+    raise SystemExit(
+        "The `trimesh` package is required to build the runtime-safe Unitree G1 scene. "
+        "Enter `nix develop` first."
+    ) from exc
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCENE_PATH = PROJECT_ROOT / "assets" / "unitree_g1" / "g1_29dof_with_hand.xml"
-RUNTIME_SCENE_PATH = PROJECT_ROOT / "runs" / "assets" / "unitree_g1" / "g1_29dof_with_hand_runtime.xml"
+RUNTIME_SCENE_PATH = (
+    PROJECT_ROOT / "runs" / "assets" / "unitree_g1" / "g1_29dof_with_hand_runtime.xml"
+)
 LOG_PATH = PROJECT_ROOT / "runs" / "logs" / "pre-reveal-error.log"
 
 
 class JointInterface(Protocol):
     """Generic robot-style interface for joint-space control."""
 
-    def set_joint_position(self, joint_name: str, angle: float, time_sec: float) -> None:
-        ...
+    def set_joint_position(
+        self, joint_name: str, angle: float, time_sec: float
+    ) -> None: ...
 
-    def move_joints(self, joint_targets: dict[str, float], time_sec: float) -> None:
-        ...
+    def move_joints(self, joint_targets: dict[str, float], time_sec: float) -> None: ...
 
-    def sleep(self, time_sec: float) -> None:
-        ...
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Run the Unitree G1 right-arm pre-reveal pumping motion in MuJoCo. "
-            "Use `--print-joints-only` to inspect the motion plan without launching the simulator."
-        )
-    )
-    parser.add_argument(
-        "--scene-path",
-        default=str(SCENE_PATH),
-        help="Optional path to the Unitree G1 MuJoCo scene XML.",
-    )
-    parser.add_argument(
-        "--print-joints-only",
-        action="store_true",
-        help="Print the motion summary and exit without importing MuJoCo or trimesh.",
-    )
-    return parser.parse_args()
+    def sleep(self, time_sec: float) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -75,20 +72,25 @@ class MotionParameters:
     waist_roll: float = 0.0
     waist_pitch: float = 0.02
 
-    # Right shoulder places my hand in front of my torso.
-    shoulder_pitch_baseline: float = -0.52  # about 30 deg flexion forward
-    shoulder_pitch_amplitude: float = 0.11  # about 6 deg oscillation
-    shoulder_roll: float = -0.40
-    shoulder_yaw: float = 0.14
+    # Shoulder is held nearly fixed at ~45 deg forward flexion. Roll is zero so
+    # the upper arm stays in the sagittal plane (in front of the torso) rather
+    # than swung out to the side.
+    shoulder_pitch_baseline: float = -0.785  # 45 deg forward flexion
+    shoulder_pitch_amplitude: float = 0.02  # ~1 deg residual wobble only
+    shoulder_roll: float = 0.0  # arm forward, not outward
+    shoulder_yaw: float = 0.0  # no twist
 
-    # Elbow is the main driver of the pumping motion.
-    elbow_flex_baseline: float = 1.66  # about 95 deg flexion
-    elbow_flex_amplitude: float = 0.22  # about 12.5 deg oscillation
+    # Elbow is the sole driver of the pumping motion. In this URDF qpos ~1.833
+    # is "straight"; flexion happens as qpos decreases below that. The interior
+    # angle between forearm and upper arm sweeps roughly 90 deg (right angle)
+    # to 125 deg (moderately straight).
+    elbow_flex_baseline: float = 0.568  # midpoint, interior ~107 deg
+    elbow_flex_amplitude: float = 0.306  # sweep +/- ~17.5 deg
 
     # Keep forearm and wrist nearly fixed.
     forearm_rotation: float = -0.08  # slight pronation proxy via wrist roll
-    wrist_pitch: float = -0.16
-    wrist_yaw: float = -0.12
+    wrist_pitch: float = -0.18
+    wrist_yaw: float = -0.16
 
     # Keep the hand concealed in a neutral pre-shape.
     finger_flex: float = 0.34
@@ -135,11 +137,13 @@ def pumping_pose(params: MotionParameters, cycle_phase: float) -> dict[str, floa
     # Smooth periodic trajectory: cosine keeps turnarounds gentle.
     cosine = math.cos(2.0 * math.pi * cycle_phase)
 
-    shoulder_pitch = params.shoulder_pitch_baseline + params.shoulder_pitch_amplitude * cosine
+    shoulder_pitch = (
+        params.shoulder_pitch_baseline + params.shoulder_pitch_amplitude * cosine
+    )
     elbow_flex = params.elbow_flex_baseline - params.elbow_flex_amplitude * cosine
 
-    # Small shoulder compensation keeps the hand path nearly vertical.
-    shoulder_yaw = params.shoulder_yaw + 0.02 * math.sin(2.0 * math.pi * cycle_phase)
+    # Shoulder is intentionally held still — elbow alone drives the motion.
+    shoulder_yaw = params.shoulder_yaw
 
     return {
         "waist_yaw_joint": params.waist_yaw,
@@ -168,20 +172,32 @@ def joint_motion_table(params: MotionParameters) -> str:
     rows = [
         ("waist_yaw_joint", f"{params.waist_yaw:+.2f}", "stable torso alignment"),
         ("waist_roll_joint", f"{params.waist_roll:+.2f}", "upright torso"),
-        ("waist_pitch_joint", f"{params.waist_pitch:+.2f}", "small forward presentation"),
+        (
+            "waist_pitch_joint",
+            f"{params.waist_pitch:+.2f}",
+            "small forward presentation",
+        ),
         (
             "right_shoulder_pitch_joint",
             f"{params.shoulder_pitch_baseline:+.2f} +/- {params.shoulder_pitch_amplitude:.2f}",
-            "small cyclic compensation arc",
+            "held near 45 deg forward, nearly still",
         ),
-        ("right_shoulder_roll_joint", f"{params.shoulder_roll:+.2f}", "holds arm in front of torso"),
-        ("right_shoulder_yaw_joint", f"{params.shoulder_yaw:+.2f} +/- 0.02", "tiny fore-aft arc"),
+        (
+            "right_shoulder_roll_joint",
+            f"{params.shoulder_roll:+.2f}",
+            "zero -> arm in sagittal plane",
+        ),
+        ("right_shoulder_yaw_joint", f"{params.shoulder_yaw:+.2f}", "zero -> no twist"),
         (
             "right_elbow_joint",
             f"{params.elbow_flex_baseline:+.2f} +/- {params.elbow_flex_amplitude:.2f}",
-            "primary pumping driver",
+            "sole driver, interior angle 90 deg .. 125 deg",
         ),
-        ("right_wrist_roll_joint", f"{params.forearm_rotation:+.2f}", "near-neutral pronation"),
+        (
+            "right_wrist_roll_joint",
+            f"{params.forearm_rotation:+.2f}",
+            "near-neutral pronation",
+        ),
         ("right_wrist_pitch_joint", f"{params.wrist_pitch:+.2f}", "quiet wrist"),
         ("right_wrist_yaw_joint", f"{params.wrist_yaw:+.2f}", "quiet wrist"),
         ("right_hand_*", f"{params.finger_flex:+.2f}", "concealed neutral pre-shape"),
@@ -201,11 +217,22 @@ class SimulatorArmInterface(JointInterface):
         self.data = self._mujoco.MjData(self.model)
         self.control_dt = control_dt
         self.current_targets = setup_pose(MotionParameters())
+        # The passive viewer renders from `self.data` on the main thread while
+        # the motion runner mutates it on a worker thread. We hold the
+        # viewer-provided lock around every mutation to avoid
+        # `mj_copyDataVisual: attempting to copy mjData while stack is in use`.
+        self.viewer = None
+        # Signal used to stop the motion thread early when the viewer closes,
+        # so it cannot still be writing into `self.data` while MuJoCo tears
+        # down GL resources (which would segfault on exit).
+        self.should_stop = threading.Event()
 
     def _joint_id(self, joint_name: str) -> int:
-        joint_id = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
         if joint_id < 0:
-            raise ValueError(f"Joint '{joint_name}' was not found in the Unitree G1 model.")
+            raise ValueError(
+                f"Joint '{joint_name}' was not found in the Unitree G1 model."
+            )
         return joint_id
 
     def clamp_to_limits(self, joint_name: str, angle: float) -> float:
@@ -215,23 +242,27 @@ class SimulatorArmInterface(JointInterface):
             return max(float(low), min(float(high), angle))
         return angle
 
-    def set_joint_position(self, joint_name: str, angle: float, time_sec: float) -> None:
+    def set_joint_position(
+        self, joint_name: str, angle: float, time_sec: float
+    ) -> None:
         self.move_joints({joint_name: angle}, time_sec)
 
     def _apply_targets(self, joint_targets: dict[str, float]) -> None:
-        self.data.qpos[:] = 0.0
-        self.data.qvel[:] = 0.0
-        self.data.qpos[:7] = [0.0, 0.0, 0.79, 1.0, 0.0, 0.0, 0.0]
+        lock_ctx = self.viewer.lock() if self.viewer is not None else _nullcontext()
+        with lock_ctx:
+            self.data.qpos[:] = 0.0
+            self.data.qvel[:] = 0.0
+            self.data.qpos[:7] = [0.0, 0.0, 0.79, 1.0, 0.0, 0.0, 0.0]
 
-        for joint_name, angle in joint_targets.items():
-            joint_id = self._joint_id(joint_name)
-            qpos_index = self.model.jnt_qposadr[joint_id]
-            self.data.qpos[qpos_index] = self.clamp_to_limits(joint_name, angle)
+            for joint_name, angle in joint_targets.items():
+                joint_id = self._joint_id(joint_name)
+                qpos_index = self.model.jnt_qposadr[joint_id]
+                self.data.qpos[qpos_index] = self.clamp_to_limits(joint_name, angle)
 
-        if self.model.nu:
-            self.data.ctrl[:] = 0.0
+            if self.model.nu:
+                self.data.ctrl[:] = 0.0
 
-        self._mujoco.mj_forward(self.model, self.data)
+            mujoco.mj_forward(self.model, self.data)
         self.current_targets = dict(joint_targets)
 
     def move_joints(self, joint_targets: dict[str, float], time_sec: float) -> None:
@@ -241,32 +272,52 @@ class SimulatorArmInterface(JointInterface):
 
         steps = max(1, int(time_sec / self.control_dt))
         for step in range(1, steps + 1):
+            if self.should_stop.is_set():
+                return
             alpha = step / steps
             eased = 0.5 - 0.5 * math.cos(math.pi * alpha)
             interpolated = {
                 joint_name: start_targets.get(joint_name, 0.0)
-                + (merged_targets[joint_name] - start_targets.get(joint_name, 0.0)) * eased
+                + (merged_targets[joint_name] - start_targets.get(joint_name, 0.0))
+                * eased
                 for joint_name in merged_targets
             }
             self._apply_targets(interpolated)
-            time.sleep(self.control_dt)
+            # Use Event.wait so a stop signal interrupts the sleep promptly.
+            if self.should_stop.wait(self.control_dt):
+                return
 
     def sleep(self, time_sec: float) -> None:
-        time.sleep(time_sec)
+        if self.should_stop.wait(time_sec):
+            return
 
     def launch_viewer_with_motion(self, motion_runner: callable) -> None:
         try:
-            with self._mujoco.viewer.launch_passive(self.model, self.data) as viewer:
-                thread = threading.Thread(target=motion_runner, daemon=True)
-                thread.start()
-                while viewer.is_running() and thread.is_alive():
-                    viewer.sync()
-                    time.sleep(self.control_dt)
-                thread.join(timeout=1.0)
+            with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
+                self.viewer = viewer
+                self.should_stop.clear()
+                thread = threading.Thread(target=motion_runner, daemon=False)
+                try:
+                    thread.start()
+                    while viewer.is_running() and thread.is_alive():
+                        viewer.sync()
+                        time.sleep(self.control_dt)
+                finally:
+                    # Tell the worker to bail out and wait for it to actually
+                    # leave `_apply_targets` before letting the viewer's
+                    # `__exit__` tear down GL resources. Without this the
+                    # daemon thread can be mid-write into `self.data` when GL
+                    # cleanup runs, which segfaults.
+                    self.should_stop.set()
+                    thread.join(timeout=2.0)
+                    self.viewer = None
         except Exception as error:
+            self.viewer = None
             LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             LOG_PATH.write_text(traceback.format_exc())
-            if sys.platform == "darwin" and "run under `mjpython` on macOS" in str(error):
+            if sys.platform == "darwin" and "run under `mjpython` on macOS" in str(
+                error
+            ):
                 print("Passive viewer is unavailable under plain `python` on macOS.")
                 print(
                     "For the passive viewer, run: nix develop -c mjpython scripts/pre_reveal_right_arm.py"
@@ -275,7 +326,7 @@ class SimulatorArmInterface(JointInterface):
                 print(f"Passive viewer failed. Details saved to {LOG_PATH}")
             thread = threading.Thread(target=motion_runner, daemon=True)
             thread.start()
-            self._mujoco.viewer._launch_internal(  # type: ignore[attr-defined]
+            mujoco.viewer._launch_internal(  # type: ignore[attr-defined]
                 self.model,
                 self.data,
                 run_physics_thread=False,
@@ -351,31 +402,7 @@ def _flatten_rows(rows) -> str:
     return " ".join(" ".join(f"{value:.9g}" for value in row) for row in rows)
 
 
-def import_mujoco():
-    try:
-        import mujoco
-        import mujoco.viewer
-    except ModuleNotFoundError as exc:  # pragma: no cover - local setup guard
-        raise SystemExit(
-            "MuJoCo Python bindings are not installed. Enter `nix develop` first "
-            "before running this script."
-        ) from exc
-    return mujoco
-
-
-def import_trimesh():
-    try:
-        import trimesh
-    except ModuleNotFoundError as exc:  # pragma: no cover - local setup guard
-        raise SystemExit(
-            "The `trimesh` package is required to build the runtime-safe Unitree G1 scene. "
-            "Enter `nix develop` first."
-        ) from exc
-    return trimesh
-
-
 def main() -> None:
-    args = parse_args()
     params = MotionParameters()
     print("Right-arm pre-reveal control strategy:")
     print("I keep my torso stable, hold my concealed right hand in front of my torso,")
@@ -386,11 +413,10 @@ def main() -> None:
     print("Joint-level motion table:")
     print(joint_motion_table(params))
 
-    if args.print_joints_only:
-        return
-
-    simulator = SimulatorArmInterface(Path(args.scene_path), params.control_dt)
-    simulator.launch_viewer_with_motion(lambda: run_pre_reveal_motion(simulator, params))
+    simulator = SimulatorArmInterface(SCENE_PATH, params.control_dt)
+    simulator.launch_viewer_with_motion(
+        lambda: run_pre_reveal_motion(simulator, params)
+    )
 
 
 if __name__ == "__main__":

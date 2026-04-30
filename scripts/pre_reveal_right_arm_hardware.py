@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,6 +15,13 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, candidate_str)
 
 from g1_rps.arm_hardware import ArmHardwareConfig, run_pre_reveal_right_arm_hardware
+
+CPP_HELPER_SOURCE = (
+    PROJECT_ROOT / "src" / "g1_rps" / "cpp" / "pre_reveal_right_arm_hardware.cpp"
+)
+CPP_HELPER_BINARY = (
+    PROJECT_ROOT / "runs" / "bin" / "g1_pre_reveal_right_arm_hardware_cpp"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +59,23 @@ def parse_args() -> argparse.Namespace:
         help="How long to wait for the robot's `rt/lowstate` sample before failing.",
     )
     parser.add_argument(
+        "--motion-switch-timeout-seconds",
+        type=float,
+        default=5.0,
+        help="How long to spend asking MotionSwitcherClient to release high-level mode.",
+    )
+    parser.add_argument(
+        "--no-auto-release",
+        action="store_true",
+        help="Skip MotionSwitcherClient release. Use this after releasing manually with L2+B then L2+R2.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "cpp", "python"),
+        default="auto",
+        help="DDS backend for real hardware. `auto` uses the C++ Unitree SDK when available.",
+    )
+    parser.add_argument(
         "--print-state",
         action="store_true",
         help="Print the initial right-arm joint state before moving.",
@@ -58,22 +83,114 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--live",
         action="store_true",
-        help="Actually send `rt/arm_sdk` commands to the real robot. Without this flag it is a dry run.",
+        help="Actually send `rt/lowcmd` commands to the real robot. Without this flag it is a dry run.",
     )
     return parser.parse_args()
 
 
+def unitree_cpp_sdk_prefix() -> Path | None:
+    for prefix in (Path("/usr/local"), Path("/opt/unitree_robotics")):
+        header = (
+            prefix / "include" / "unitree" / "robot" / "channel" / "channel_factory.hpp"
+        )
+        library = prefix / "lib" / "libunitree_sdk2.a"
+        if header.exists() and library.exists():
+            return prefix
+    return None
+
+
+def build_cpp_helper() -> None:
+    prefix = unitree_cpp_sdk_prefix()
+    if prefix is None:
+        raise RuntimeError(
+            "Unitree C++ SDK was not found under /usr/local or /opt/unitree_robotics."
+        )
+    if not CPP_HELPER_SOURCE.exists():
+        raise RuntimeError(f"C++ backend source was not found: {CPP_HELPER_SOURCE}")
+
+    if (
+        CPP_HELPER_BINARY.exists()
+        and CPP_HELPER_BINARY.stat().st_mtime >= CPP_HELPER_SOURCE.stat().st_mtime
+    ):
+        return
+
+    CPP_HELPER_BINARY.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "g++",
+        "-std=c++17",
+        "-O2",
+        f"-I{prefix / 'include'}",
+        f"-I{prefix / 'include' / 'ddscxx'}",
+        f"-L{prefix / 'lib'}",
+        f"-Wl,-rpath,{prefix / 'lib'}",
+        "-o",
+        str(CPP_HELPER_BINARY),
+        str(CPP_HELPER_SOURCE),
+        "-lunitree_sdk2",
+        "-lddscxx",
+        "-lddsc",
+        "-lpthread",
+    ]
+    try:
+        subprocess.run(cmd, check=True, text=True, capture_output=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("`g++` is required to build the C++ backend.") from exc
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(f"Failed to build C++ backend:\n{details}") from exc
+
+
+def run_cpp_backend(args: argparse.Namespace) -> None:
+    if args.interface is None:
+        raise RuntimeError("The C++ backend requires --interface.")
+    build_cpp_helper()
+
+    cmd = [
+        str(CPP_HELPER_BINARY),
+        "--interface",
+        args.interface,
+        "--domain-id",
+        str(args.domain_id),
+        "--state-timeout-seconds",
+        str(args.state_timeout_seconds),
+        "--motion-switch-timeout-seconds",
+        str(args.motion_switch_timeout_seconds),
+    ]
+    if args.live:
+        cmd.append("--live")
+    if args.print_state:
+        cmd.append("--print-state")
+    if args.no_auto_release:
+        cmd.append("--no-auto-release")
+
+    raise SystemExit(subprocess.run(cmd).returncode)
+
+
 def main() -> None:
     args = parse_args()
+
+    if args.backend in ("auto", "cpp") and (args.live or args.print_state):
+        try:
+            run_cpp_backend(args)
+        except RuntimeError as exc:
+            if args.backend == "cpp":
+                raise SystemExit(str(exc)) from None
+            print(f"C++ backend unavailable ({exc}). Falling back to Python DDS.")
+
     config = ArmHardwareConfig(
         interface=args.interface,
         domain_id=args.domain_id,
         arm_dof=args.arm_dof,
         live=args.live,
         print_state=args.print_state,
+        auto_release_mode=not args.no_auto_release,
         state_timeout_seconds=args.state_timeout_seconds,
+        motion_switch_timeout_seconds=args.motion_switch_timeout_seconds,
     )
-    run_pre_reveal_right_arm_hardware(config)
+    try:
+        run_pre_reveal_right_arm_hardware(config)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
 
 
 if __name__ == "__main__":

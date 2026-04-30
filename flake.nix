@@ -23,8 +23,8 @@
       mkProjectPackages =
         pkgs:
         let
-          python = pkgs.python313;
-          py = pkgs.python313Packages;
+          python = pkgs.python312;
+          py = pkgs.python312Packages;
 
           richClickPy = py.buildPythonPackage rec {
             pname = "rich-click";
@@ -42,14 +42,25 @@
 
           cycloneddsPy = py.buildPythonPackage rec {
             pname = "cyclonedds";
-            version = "11.0.1";
-            format = "wheel";
+            version = "0.10.5";
+            pyproject = true;
             src = pkgs.fetchurl {
-              url = "https://files.pythonhosted.org/packages/eb/a5/a6c8052dafd16c8c0e02eb6ef0cb2bb086d726d654c56e94ec4cdb1640ab/cyclonedds-11.0.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl";
-              hash = "sha256-/vH2zhFaV54yLzFWhC6LZgiD5Oiwqi9eKj3515WdFzY=";
+              url = "https://files.pythonhosted.org/packages/91/cf/28eb9c823dfc245c540f5286d71b44aeee2a51021fc85b25bb9562be78cc/cyclonedds-0.10.5.tar.gz";
+              hash = "sha256-Y/xNb9sv01GBxA9OkHVxSfLe9fVw7xn7ce3E9Wh1X4o=";
             };
-            nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+            build-system = with py; [
+              setuptools
+              wheel
+            ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.cyclonedds ];
             propagatedBuildInputs = [ richClickPy ];
+            env.CYCLONEDDS_HOME = pkgs.cyclonedds;
+            pythonImportsCheck = [
+              "cyclonedds"
+              "cyclonedds.domain"
+            ];
+            doCheck = false;
           };
 
           unitreeSdk2Py = py.buildPythonPackage rec {
@@ -96,13 +107,38 @@
             doCheck = false;
           };
 
+          mediapipePy = py.buildPythonPackage rec {
+            pname = "mediapipe";
+            version = "0.10.35";
+            format = "wheel";
+            src = pkgs.fetchurl {
+              url = "https://files.pythonhosted.org/packages/32/8f/1bc57dbc9b7b03c8f875aac23380ec57e9002cc02fe6720045fb263f3966/mediapipe-0.10.35-py3-none-manylinux_2_28_x86_64.whl";
+              hash = "sha256-25pXnfSM/+lXDNPpP2pdLdCJoRA7hGxgxbXeiiHDjbA=";
+            };
+            nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+            propagatedBuildInputs = [
+              py."absl-py"
+              py.certifi
+              py.flatbuffers
+              py.matplotlib
+              py.numpy
+              py."opencv-contrib-python"
+              py.protobuf
+              py.sounddevice
+            ];
+            pythonImportsCheck = [ "mediapipe" ];
+            doCheck = false;
+          };
+
           pythonEnv = python.withPackages (
             ps: with ps; [
               cycloneddsPy
               unitreeSdk2Py
+              mediapipePy
               numpy
               matplotlib
               mujoco
+              opencv-contrib-python
               imageio
               trimesh
               glfw
@@ -137,7 +173,16 @@
           };
         in
         {
-          inherit cycloneddsPy g1ArmHardware g1Demo g1HandHardware pythonEnv richClickPy unitreeSdk2Py;
+          inherit
+            cycloneddsPy
+            g1ArmHardware
+            g1Demo
+            g1HandHardware
+            pythonEnv
+            mediapipePy
+            richClickPy
+            unitreeSdk2Py
+            ;
         };
     in
     {
