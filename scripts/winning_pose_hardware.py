@@ -9,6 +9,7 @@ right shoulder/elbow/wrist) are commanded.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +24,7 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
 from g1_rps.arm_hardware import (
     ArmHardwareConfig,
     run_winning_pose_hardware,
+    validate_dds_network_interface,
 )
 
 CPP_HELPER_SOURCE = (
@@ -113,6 +115,41 @@ def unitree_cpp_sdk_prefix() -> Path | None:
     return None
 
 
+def uid_is_listed_in_etc_passwd() -> bool:
+    uid_text = str(os.getuid())
+    try:
+        for line in (
+            Path("/etc/passwd")
+            .read_text(encoding="utf-8", errors="ignore")
+            .splitlines()
+        ):
+            fields = line.split(":")
+            if len(fields) > 2 and fields[2] == uid_text:
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def cpp_helper_has_nix_runtime() -> bool:
+    try:
+        return b"/nix/store/" in CPP_HELPER_BINARY.read_bytes()
+    except OSError:
+        return False
+
+
+def cpp_helper_may_fail_unitree_user_lookup() -> bool:
+    return cpp_helper_has_nix_runtime() and not uid_is_listed_in_etc_passwd()
+
+
+def cpp_helper_needs_rebuild() -> bool:
+    if not CPP_HELPER_BINARY.exists():
+        return True
+    if CPP_HELPER_BINARY.stat().st_mtime < CPP_HELPER_SOURCE.stat().st_mtime:
+        return True
+    return cpp_helper_may_fail_unitree_user_lookup()
+
+
 def build_cpp_helper() -> None:
     prefix = unitree_cpp_sdk_prefix()
     if prefix is None:
@@ -122,11 +159,14 @@ def build_cpp_helper() -> None:
     if not CPP_HELPER_SOURCE.exists():
         raise RuntimeError(f"C++ backend source was not found: {CPP_HELPER_SOURCE}")
 
-    if (
-        CPP_HELPER_BINARY.exists()
-        and CPP_HELPER_BINARY.stat().st_mtime >= CPP_HELPER_SOURCE.stat().st_mtime
-    ):
+    if not cpp_helper_needs_rebuild():
         return
+
+    if cpp_helper_may_fail_unitree_user_lookup():
+        print(
+            "Existing C++ backend was linked against a Nix runtime that cannot "
+            "resolve this NSS-only user. Rebuilding with the current compiler."
+        )
 
     CPP_HELPER_BINARY.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -152,6 +192,14 @@ def build_cpp_helper() -> None:
     except subprocess.CalledProcessError as exc:
         details = (exc.stderr or exc.stdout or "").strip()
         raise RuntimeError(f"Failed to build C++ backend:\n{details}") from exc
+
+    if cpp_helper_may_fail_unitree_user_lookup():
+        raise RuntimeError(
+            "The rebuilt C++ backend still links against a Nix runtime, while "
+            f"UID {os.getuid()} is not present in /etc/passwd. Unitree SDK2 is "
+            "likely to fail with `getpwuid error`; rebuild with the system "
+            "compiler/runtime or add a local passwd entry for this user."
+        )
 
 
 def run_cpp_backend(args: argparse.Namespace) -> None:
@@ -184,6 +232,10 @@ def run_cpp_backend(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    try:
+        validate_dds_network_interface(args.interface)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
 
     if args.backend in ("auto", "cpp") and (args.live or args.print_state):
         try:

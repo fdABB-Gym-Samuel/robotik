@@ -147,6 +147,9 @@ RIGHT_ARM_5_JOINTS = {
     "right_wrist_roll_joint": G1JointIndex.RightWristRoll,
 }
 
+# Backwards-compatible default for older helper scripts that predate arm_dof.
+RIGHT_ARM_JOINTS = RIGHT_ARM_7_JOINTS
+
 UPPER_BODY_7_JOINTS = {
     "left_shoulder_pitch_joint": G1JointIndex.LeftShoulderPitch,
     "left_shoulder_roll_joint": G1JointIndex.LeftShoulderRoll,
@@ -261,7 +264,7 @@ def add_joint_deltas(
 
 
 def ready_right_arm_pose(config: ArmHardwareConfig) -> dict[str, float]:
-    return {
+    pose = {
         "right_shoulder_pitch_joint": -0.785,
         "right_shoulder_roll_joint": 0.0,
         "right_shoulder_yaw_joint": 0.0,
@@ -294,6 +297,13 @@ def interface_ipv4_address(interface: str | None) -> str | None:
         sock.close()
 
 
+def network_interface_names() -> list[str]:
+    try:
+        return sorted(name for _, name in socket.if_nameindex())
+    except OSError:
+        return sorted(path.name for path in Path("/sys/class/net").iterdir())
+
+
 def interface_link_status(interface: str | None) -> tuple[str | None, str | None]:
     if interface is None:
         return None, None
@@ -311,6 +321,62 @@ def interface_link_status(interface: str | None) -> tuple[str | None, str | None
         carrier = None
 
     return operstate, carrier
+
+
+def describe_network_interface(interface: str) -> str:
+    ipv4_address = interface_ipv4_address(interface) or "no IPv4"
+    operstate, carrier = interface_link_status(interface)
+    status_parts = [ipv4_address]
+    if operstate is not None:
+        status_parts.append(f"state={operstate}")
+    if carrier is not None:
+        status_parts.append(f"carrier={carrier}")
+    return f"{interface} ({', '.join(status_parts)})"
+
+
+def validate_dds_network_interface(interface: str | None) -> None:
+    if interface is None:
+        return
+
+    interface_names = network_interface_names()
+    if interface not in interface_names:
+        available = ", ".join(interface_names) or "none"
+        raise RuntimeError(
+            f"DDS interface `{interface}` was not found. Available interfaces: {available}."
+        )
+
+    interface_description = describe_network_interface(interface)
+    interface_ipv4 = interface_ipv4_address(interface)
+    operstate, carrier = interface_link_status(interface)
+    problems = []
+    guidance = []
+    if carrier == "down":
+        problems.append("carrier is down")
+        guidance.append(
+            "Check the Ethernet cable, robot power, and robot-side network port."
+        )
+    elif operstate == "down":
+        problems.append("link state is down")
+        guidance.append(f"Bring it up with `sudo ip link set {interface} up`.")
+    if interface_ipv4 is None:
+        problems.append("it has no IPv4 address")
+        guidance.append(
+            "For the typical Unitree 192.168.123.0/24 LAN, use an unused "
+            f"address such as `sudo ip addr add 192.168.123.222/24 dev {interface}`."
+        )
+
+    if problems:
+        available = "; ".join(
+            describe_network_interface(name) for name in interface_names
+        )
+        problem_text = "; ".join(problems)
+        guidance_text = " ".join(guidance)
+        raise RuntimeError(
+            f"DDS interface `{interface}` exists, but it is not usable for "
+            f"the Unitree robot LAN ({interface_description}: {problem_text}). "
+            f"{guidance_text} "
+            f"Current interfaces: {available}."
+        )
 
 
 def likely_wsl_nat_address(ipv4_address: str | None) -> bool:
@@ -445,7 +511,7 @@ class UnitreeLowCmdSession:
         self._publisher.Init()
         self._subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self._subscriber.Init(self._low_state_handler, 10)
-        self._right_arm_indices = set(RIGHT_ARM_JOINTS.values())
+        self._right_arm_indices = set(self._right_arm_joints.values())
         self._hold_q: list[float] = [0.0] * NUM_G1_MOTORS
         self._cyclonedds_log_path = log_path
 
@@ -603,16 +669,9 @@ class UnitreeLowCmdSession:
 
     def current_right_arm_pose(self) -> dict[str, float]:
         state = self.wait_for_state()
-        return [
-            float(state.motor_state[joint_index].q)
-            for joint_index in range(G1_NUM_MOTOR)
-        ]
-
-    def current_right_arm_pose(self) -> dict[str, float]:
-        motor_positions = self.current_motor_positions()
         pose: dict[str, float] = {}
         for joint_name, joint_index in self._right_arm_joints.items():
-            pose[joint_name] = motor_positions[joint_index]
+            pose[joint_name] = float(state.motor_state[joint_index].q)
         return pose
 
     def publish_pose(self, pose: dict[str, float]) -> None:
@@ -640,7 +699,7 @@ class UnitreeLowCmdSession:
                 motor_cmd.kd = self._config.hold_kd
 
         for joint_name, target in pose.items():
-            joint_index = RIGHT_ARM_JOINTS[joint_name]
+            joint_index = self._right_arm_joints[joint_name]
             low_cmd.motor_cmd[joint_index].q = float(target)
 
         low_cmd.crc = self._crc.Crc(low_cmd)
@@ -655,10 +714,7 @@ class UnitreeLowCmdSession:
         steps = max(1, int(duration / self._config.control_dt))
         for step in range(1, steps + 1):
             alpha = ease_in_out_cubic(step / steps)
-            positions = [
-                (1.0 - alpha) * start + alpha * target
-                for start, target in zip(start_positions, target_positions, strict=True)
-            ]
+            pose = blend_pose(start_pose, target_pose, alpha)
             if self._config.live:
                 self.publish_pose(pose)
             time.sleep(self._config.control_dt)
@@ -702,12 +758,12 @@ def _apply_right_arm_pose(
 
 
 def run_pre_reveal_right_arm_hardware(config: ArmHardwareConfig) -> None:
-    ready_right_pose = ready_right_arm_pose(config)
+    ready_pose = ready_right_arm_pose(config)
 
     if not config.live and not config.print_state:
         print("Dry run only. No real robot commands were sent.")
         print("Planned ready pose:")
-        for joint_name, value in ready_right_pose.items():
+        for joint_name, value in ready_pose.items():
             print(f"  {joint_name}: {value:+.3f}")
         return
 
@@ -717,7 +773,7 @@ def run_pre_reveal_right_arm_hardware(config: ArmHardwareConfig) -> None:
 
     if config.print_state:
         print("Initial right-arm joint state:")
-        for joint_name, value in start_right_pose.items():
+        for joint_name, value in start_pose.items():
             print(f"  {joint_name}: {value:+.3f}")
 
     if not config.live:

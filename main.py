@@ -30,6 +30,7 @@ Prerequisites for --live:
 from __future__ import annotations
 
 import argparse
+import importlib
 import random
 import select
 import sys
@@ -61,11 +62,10 @@ from g1_rps.arm_hardware import (
     ready_right_arm_pose,
     winning_pose,
 )
-from g1_rps.vision import (
-    ClassifierConfig,
-    HandGestureClassifier,
-    draw_landmarks,
-)
+
+ClassifierConfig = None
+HandGestureClassifier = None
+draw_landmarks = None
 
 
 GESTURES: tuple[str, ...] = ("rock", "paper", "scissors")
@@ -108,6 +108,7 @@ class OpponentVisionThread(threading.Thread):
         classifier: HandGestureClassifier,
         display: bool = True,
         window_name: str = "G1 opponent view",
+        initial_frame: np.ndarray | None = None,
     ) -> None:
         super().__init__(name="opponent-vision", daemon=True)
         self._client = video_client
@@ -123,20 +124,34 @@ class OpponentVisionThread(threading.Thread):
         self._last_frame_gesture: str | None = None
         self._last_frame_extended: tuple[str, ...] = ()
         self._frames_processed = 0
+        self._bad_frame_count = 0
+        self._last_bad_frame_report = 0.0
         self._error: BaseException | None = None
+        self._initial_frame = initial_frame
 
     def run(self) -> None:
         try:
             while not self._stop_event.is_set():
-                code, data = self._client.GetImageSample()
-                if code != 0:
-                    time.sleep(0.05)
-                    continue
-                if isinstance(data, list):
-                    data = bytes(data)
-                buf = np.frombuffer(data, dtype=np.uint8)
-                frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                if self._initial_frame is not None:
+                    frame = self._initial_frame
+                    self._initial_frame = None
+                else:
+                    code, data = self._client.GetImageSample()
+                    if code != 0:
+                        time.sleep(0.05)
+                        continue
+                    frame = _decode_unitree_image_sample(data)
                 if frame is None:
+                    self._bad_frame_count += 1
+                    now = time.monotonic()
+                    if now - self._last_bad_frame_report >= 2.0:
+                        self._last_bad_frame_report = now
+                        print(
+                            "  vision: waiting for non-empty camera image bytes "
+                            f"({self._bad_frame_count} empty/invalid samples)",
+                            flush=True,
+                        )
+                    time.sleep(0.05)
                     continue
                 result = self._classifier.classify(frame)
                 with self._lock:
@@ -375,14 +390,73 @@ def _draw_label_overlay(
         y += 36
 
 
-def _create_front_video_client(timeout_seconds: float):
-    """Front-camera video client. Edit this if your G1's SDK uses a different path."""
-    from unitree_sdk2py.b2.front_video.front_video_client import FrontVideoClient
+_VIDEO_CLIENTS = {
+    "videohub": ("unitree_sdk2py.go2.video.video_client", "VideoClient"),
+    "front": ("unitree_sdk2py.b2.front_video.front_video_client", "FrontVideoClient"),
+    "back": ("unitree_sdk2py.b2.back_video.back_video_client", "BackVideoClient"),
+}
 
-    client = FrontVideoClient()
+
+def _decode_unitree_image_sample(data) -> np.ndarray | None:
+    if data is None:
+        return None
+    if isinstance(data, list):
+        data = bytes(data)
+    try:
+        buf = np.frombuffer(data, dtype=np.uint8)
+    except TypeError:
+        return None
+    if buf.size == 0:
+        return None
+    try:
+        return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    except cv2.error:
+        return None
+
+
+def _create_video_client(camera: str, timeout_seconds: float):
+    """Create a Unitree SDK2 video client."""
+    try:
+        module_name, class_name = _VIDEO_CLIENTS[camera]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown camera '{camera}'. Use 'videohub', 'front', or 'back'."
+        ) from exc
+
+    module = importlib.import_module(module_name)
+    client = getattr(module, class_name)()
     client.SetTimeout(timeout_seconds)
     client.Init()
     return client
+
+
+def _read_first_camera_frame(
+    video_client,
+    camera: str,
+    timeout_seconds: float,
+) -> np.ndarray:
+    deadline = time.monotonic() + timeout_seconds
+    attempts = 0
+    last_problem = "no samples received"
+
+    while True:
+        attempts += 1
+        code, data = video_client.GetImageSample()
+        if code != 0:
+            last_problem = f"GetImageSample returned code {code}"
+        else:
+            frame = _decode_unitree_image_sample(data)
+            if frame is not None:
+                return frame
+            last_problem = "empty or invalid image payload"
+
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError(
+                f"{camera} camera did not produce a decodable frame after "
+                f"{attempts} samples ({last_problem})."
+            )
+        time.sleep(0.05)
 
 
 def _read_right_arm_pose(
@@ -454,13 +528,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-camera",
         action="store_true",
-        help="Skip opening the front camera and the vision thread.",
+        help="Skip opening the camera and the vision thread.",
+    )
+    parser.add_argument(
+        "--camera",
+        choices=("videohub", "front", "back"),
+        default="videohub",
+        help=(
+            "Unitree SDK2 camera service. `videohub` is the G1/Go2-style "
+            "service; `front`/`back` are older B2-style services."
+        ),
     )
     parser.add_argument(
         "--camera-timeout",
         type=float,
         default=3.0,
         help="Per-call image timeout for the Unitree video client.",
+    )
+    parser.add_argument(
+        "--camera-startup-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for the first decodable camera frame before starting MediaPipe.",
     )
     display_group = parser.add_mutually_exclusive_group()
     display_group.add_argument(
@@ -524,12 +613,30 @@ def main() -> int:
     vision_thread: OpponentVisionThread | None = None
     classifier: HandGestureClassifier | None = None
     if not args.no_camera:
-        print("Opening front camera and vision pipeline...")
+        print(f"Opening {args.camera} camera and vision pipeline...")
         try:
-            front_client = _create_front_video_client(args.camera_timeout)
+            video_client = _create_video_client(args.camera, args.camera_timeout)
+            first_frame = _read_first_camera_frame(
+                video_client, args.camera, args.camera_startup_timeout
+            )
+
+            from g1_rps.vision import (
+                ClassifierConfig as VisionClassifierConfig,
+                HandGestureClassifier as VisionHandGestureClassifier,
+                draw_landmarks as vision_draw_landmarks,
+            )
+
+            global ClassifierConfig, HandGestureClassifier, draw_landmarks
+            ClassifierConfig = VisionClassifierConfig
+            HandGestureClassifier = VisionHandGestureClassifier
+            draw_landmarks = vision_draw_landmarks
+
             classifier = HandGestureClassifier(ClassifierConfig())
             vision_thread = OpponentVisionThread(
-                front_client, classifier, display=args.display
+                video_client,
+                classifier,
+                display=args.display,
+                initial_frame=first_frame,
             )
             vision_thread.start()
             if args.display:
