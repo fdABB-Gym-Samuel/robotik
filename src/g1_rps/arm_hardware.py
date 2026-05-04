@@ -806,6 +806,16 @@ def winning_pose(config: ArmHardwareConfig) -> dict[str, float]:
     return {name: pose[name] for name in pose if name in upper_body}
 
 
+def lose_pose(config: ArmHardwareConfig) -> dict[str, float]:
+    """Placeholder for the loss reaction pose. NOT YET IMPLEMENTED.
+
+    Returns the ready right-arm pose so the arm stays at the concealed position
+    until a real lose pose is designed (e.g., shoulder droop, head down).
+    """
+    # TODO: design and implement a real lose pose.
+    return dict(ready_right_arm_pose(config))
+
+
 def run_winning_pose_hardware(config: ArmHardwareConfig) -> None:
     target_pose = winning_pose(config)
 
