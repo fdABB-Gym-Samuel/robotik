@@ -115,16 +115,21 @@ def concealed_hand_pose(params: MotionParameters) -> dict[str, float]:
 
 
 def setup_pose(params: MotionParameters) -> dict[str, float]:
-    """Ready pose: my right hand is concealed and held in front of my torso."""
+    """Ready pose: my right hand is concealed and held in front of my torso.
+
+    Matches phase 0 of `pumping_pose` so the cycle begins — and ends — with
+    the elbow at its most extended position rather than mid-range.
+    """
 
     return {
         "waist_yaw_joint": params.waist_yaw,
         "waist_roll_joint": params.waist_roll,
         "waist_pitch_joint": params.waist_pitch,
-        "right_shoulder_pitch_joint": params.shoulder_pitch_baseline,
+        "right_shoulder_pitch_joint": params.shoulder_pitch_baseline
+        - params.shoulder_pitch_amplitude,
         "right_shoulder_roll_joint": params.shoulder_roll,
         "right_shoulder_yaw_joint": params.shoulder_yaw,
-        "right_elbow_joint": params.elbow_flex_baseline,
+        "right_elbow_joint": params.elbow_flex_baseline + params.elbow_flex_amplitude,
         "right_wrist_roll_joint": params.forearm_rotation,
         "right_wrist_pitch_joint": params.wrist_pitch,
         "right_wrist_yaw_joint": params.wrist_yaw,
@@ -135,8 +140,9 @@ def setup_pose(params: MotionParameters) -> dict[str, float]:
 def pumping_pose(params: MotionParameters, cycle_phase: float) -> dict[str, float]:
     """Compact right-arm pumping motion with elbow as the primary driver."""
 
-    # Smooth periodic trajectory: cosine keeps turnarounds gentle.
-    cosine = math.cos(2.0 * math.pi * cycle_phase)
+    # Phase-shifted cosine so phase 0 / 1 sit at the most-extended elbow pose;
+    # the cycle boundary is the natural rest point we stop on.
+    cosine = -math.cos(2.0 * math.pi * cycle_phase)
 
     shoulder_pitch = (
         params.shoulder_pitch_baseline + params.shoulder_pitch_amplitude * cosine

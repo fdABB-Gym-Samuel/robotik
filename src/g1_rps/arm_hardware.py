@@ -21,6 +21,7 @@ import math
 import os
 import socket
 import time
+from collections.abc import Iterable
 from importlib import metadata
 from dataclasses import dataclass
 from pathlib import Path
@@ -264,11 +265,13 @@ def add_joint_deltas(
 
 
 def ready_right_arm_pose(config: ArmHardwareConfig) -> dict[str, float]:
+    # Elbow rests at the extended end of the beat range so the pre-reveal
+    # rocking motion finishes at the bottom of its arc rather than flexed up.
     pose = {
         "right_shoulder_pitch_joint": -0.785,
         "right_shoulder_roll_joint": 0.0,
         "right_shoulder_yaw_joint": 0.0,
-        "right_elbow_joint": RIGHT_ELBOW_90_DEG_Q,
+        "right_elbow_joint": RIGHT_ELBOW_125_DEG_Q,
         "right_wrist_roll_joint": -0.08,
         "right_wrist_pitch_joint": config.wrist_angle,
         "right_wrist_yaw_joint": -0.16,
@@ -422,9 +425,11 @@ def beat_arm_offset(
     normalized = clamp_unit(local_time / config.beat_duration)
     extension = math.sin(math.pi * normalized)
 
-    shoulder_pitch = config.arm_amplitude * extension
-    elbow = (RIGHT_ELBOW_125_DEG_Q - RIGHT_ELBOW_90_DEG_Q) * extension
-    wrist_pitch = 0.04 * extension
+    # Ready pose sits at the extended end; the beat flexes the elbow up and
+    # the shoulder compensates in the opposite direction, then both return.
+    shoulder_pitch = -config.arm_amplitude * extension
+    elbow = (RIGHT_ELBOW_90_DEG_Q - RIGHT_ELBOW_125_DEG_Q) * extension
+    wrist_pitch = -0.04 * extension
     wrist_roll = -0.03 * beat_index
 
     deltas = {
@@ -478,6 +483,7 @@ class UnitreeLowCmdSession:
 
         self._config = config
         self._right_arm_joints = commanded_right_arm_joints(config)
+        self._upper_body_joints = commanded_upper_body_joints(config)
         self._low_state: Any | None = None
         self._last_lowstate_error: Exception | None = None
         self._crc = CRC()
@@ -512,6 +518,13 @@ class UnitreeLowCmdSession:
         self._subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self._subscriber.Init(self._low_state_handler, 10)
         self._right_arm_indices = set(self._right_arm_joints.values())
+        # Active = both arms (left + right). Used to switch between commanded
+        # and hold gains in `publish_pose`. Waist joints stay on hold gains.
+        self._active_arm_indices = {
+            joint_index
+            for joint_name, joint_index in self._upper_body_joints.items()
+            if not joint_name.startswith("waist_")
+        }
         self._hold_q: list[float] = [0.0] * NUM_G1_MOTORS
         self._cyclonedds_log_path = log_path
 
@@ -674,6 +687,18 @@ class UnitreeLowCmdSession:
             pose[joint_name] = float(state.motor_state[joint_index].q)
         return pose
 
+    def hold_pose_for(self, joint_names: Iterable[str]) -> dict[str, float]:
+        """Return the captured `_hold_q` positions for the given joint names.
+
+        Used to assemble interpolation start/end poses that mention joints
+        we don't actively drive (e.g. left arm during the right-arm-only
+        pre-reveal flow), so `blend_pose` sees matching keys on both sides.
+        """
+        return {
+            name: float(self._hold_q[self._upper_body_joints[name]])
+            for name in joint_names
+        }
+
     def publish_pose(self, pose: dict[str, float]) -> None:
         low_cmd = self._low_cmd_factory()
 
@@ -691,7 +716,7 @@ class UnitreeLowCmdSession:
             motor_cmd.tau = 0.0
             motor_cmd.dq = 0.0
             motor_cmd.q = self._hold_q[joint_index]
-            if joint_index in self._right_arm_indices:
+            if joint_index in self._active_arm_indices:
                 motor_cmd.kp = self._config.kp
                 motor_cmd.kd = self._config.kd
             else:
@@ -699,7 +724,7 @@ class UnitreeLowCmdSession:
                 motor_cmd.kd = self._config.hold_kd
 
         for joint_name, target in pose.items():
-            joint_index = self._right_arm_joints[joint_name]
+            joint_index = self._upper_body_joints[joint_name]
             low_cmd.motor_cmd[joint_index].q = float(target)
 
         low_cmd.crc = self._crc.Crc(low_cmd)
@@ -862,14 +887,50 @@ def winning_pose(config: ArmHardwareConfig) -> dict[str, float]:
     return {name: pose[name] for name in pose if name in upper_body}
 
 
-def lose_pose(config: ArmHardwareConfig) -> dict[str, float]:
-    """Placeholder for the loss reaction pose. NOT YET IMPLEMENTED.
+# Loss reaction: both hands brought up in front of the face, like a "noooo"
+# / face-cover gesture. Geometry intent:
+# - Upper arms hang close to the body with only a slight forward tilt, so
+#   the shoulders/elbows stay low rather than being raised up.
+# - Heavy elbow flex (forearm folded well past 90 deg) so the forearms
+#   point up from the elbow and bring the hands to face level.
+# - Small inward shoulder roll so the hands meet near the midline rather
+#   than ending up out at shoulder width.
+# All values stay well inside the URDF joint limits; tune in the MuJoCo
+# preview before running on hardware.
+LOSE_SHOULDER_PITCH = -0.5
+LOSE_SHOULDER_ROLL = 0.2
+LOSE_SHOULDER_YAW = 0.0
+LOSE_ELBOW = -0.8
+LOSE_WRIST_ROLL = 0.0
+LOSE_WRIST_PITCH = 0.0
+LOSE_WRIST_YAW = 0.0
 
-    Returns the ready right-arm pose so the arm stays at the concealed position
-    until a real lose pose is designed (e.g., shoulder droop, head down).
+
+def lose_pose(config: ArmHardwareConfig) -> dict[str, float]:
+    """Both hands raised in front of the face as a loss reaction.
+
+    Returns the upper-body arm joints (7 left + 7 right for arm-7, or the
+    arm-5 subset). Roll is mirrored across the midline using the same
+    sign convention as `winning_pose`.
     """
-    # TODO: design and implement a real lose pose.
-    return dict(ready_right_arm_pose(config))
+    pose = {
+        "left_shoulder_pitch_joint": LOSE_SHOULDER_PITCH,
+        "left_shoulder_roll_joint": LOSE_SHOULDER_ROLL,
+        "left_shoulder_yaw_joint": LOSE_SHOULDER_YAW,
+        "left_elbow_joint": LOSE_ELBOW,
+        "left_wrist_roll_joint": LOSE_WRIST_ROLL,
+        "left_wrist_pitch_joint": LOSE_WRIST_PITCH,
+        "left_wrist_yaw_joint": LOSE_WRIST_YAW,
+        "right_shoulder_pitch_joint": LOSE_SHOULDER_PITCH,
+        "right_shoulder_roll_joint": -LOSE_SHOULDER_ROLL,
+        "right_shoulder_yaw_joint": LOSE_SHOULDER_YAW,
+        "right_elbow_joint": LOSE_ELBOW,
+        "right_wrist_roll_joint": LOSE_WRIST_ROLL,
+        "right_wrist_pitch_joint": LOSE_WRIST_PITCH,
+        "right_wrist_yaw_joint": LOSE_WRIST_YAW,
+    }
+    upper_body = commanded_upper_body_joints(config)
+    return {name: pose[name] for name in pose if name in upper_body}
 
 
 def run_winning_pose_hardware(config: ArmHardwareConfig) -> None:

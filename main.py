@@ -80,8 +80,8 @@ WINS: frozenset[tuple[str, str]] = frozenset(
 # Sampling tunables. After pre-reveal the opponent is still mid-transition
 # from their rocking fist to their final gesture, so we wait, then take a
 # small majority vote across consecutive camera frames.
-SAMPLE_SETTLE_SECONDS = 0.6
-SAMPLE_FRAMES = 10
+SAMPLE_SETTLE_SECONDS = 0.4
+SAMPLE_FRAMES = 3
 SAMPLE_POLL_INTERVAL = 0.05  # must exceed the camera frame interval (~33 ms at 30 fps)
 SAMPLE_TIMEOUT_SECONDS = 2.0
 
@@ -249,14 +249,6 @@ def _hold_pose(
         time.sleep(config.control_dt)
 
 
-def _right_arm_subset(
-    pose: dict[str, float], config: ArmHardwareConfig
-) -> dict[str, float]:
-    """`publish_pose` only commands right-arm joints; drop everything else."""
-    right = commanded_right_arm_joints(config)
-    return {name: value for name, value in pose.items() if name in right}
-
-
 def _sample_opponent_gesture(
     session: UnitreeLowCmdSession,
     config: ArmHardwareConfig,
@@ -349,15 +341,21 @@ def run_outcome_pose(
 ) -> None:
     """Move into the win or lose pose, hold briefly, then return to ready."""
     if won:
-        target = _right_arm_subset(winning_pose(config), config)
+        target = winning_pose(config)
         print("  Robot wins -- celebrating!")
     else:
-        target = _right_arm_subset(lose_pose(config), config)
-        print("  Robot did not win -- lose pose (TODO: not yet implemented).")
+        target = lose_pose(config)
+        print("  Robot did not win -- bringing both hands to face.")
 
-    _interpolate_pose(session, config, ready_pose, target, duration=1.0)
+    # `ready_pose` is right-arm-only; fill in the left-arm joints from the
+    # captured hold pose so `blend_pose` sees matching keys on both sides
+    # and the left arm starts/ends at its at-rest position.
+    other_joints = [name for name in target if name not in ready_pose]
+    extended_ready = {**ready_pose, **session.hold_pose_for(other_joints)}
+
+    _interpolate_pose(session, config, extended_ready, target, duration=1.0)
     _hold_pose(session, config, target, duration=1.5)
-    _interpolate_pose(session, config, target, ready_pose, duration=1.0)
+    _interpolate_pose(session, config, target, extended_ready, duration=1.0)
 
 
 def _draw_label_overlay(
