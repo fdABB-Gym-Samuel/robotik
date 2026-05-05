@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import threading
 import time
+from dataclasses import dataclass, replace
 
 from .poses import DEFAULT_SEQUENCE, HAND_GESTURE_RATIOS
 
@@ -264,3 +265,86 @@ def _format_channels(channels: tuple[float, ...]) -> str:
         f"{name}={value:.2f}" for name, value in zip(RIGHT_HAND_CHANNEL_ORDER, channels)
     ]
     return ", ".join(pieces)
+
+
+class RpsHandController:
+    """Stateful Inspire-hand controller for the interactive RPS game loop.
+
+    Unlike `run_hardware_sequence` (which plays a fixed gesture sequence on
+    its own), this class is meant to be opened once, then called from the
+    main game loop to drive the active hand to a chosen gesture at the
+    moments that matter (pre-reveal fist, post-reveal gesture, between
+    rounds, etc.).
+
+    The DDS session is opened lazily in `open()` and stays alive until
+    `close()`. In dry-run mode (`config.live=False`) all calls are no-ops
+    that still update the cached channels, so the rest of the game loop
+    can run unmodified without a robot connected.
+    """
+
+    def __init__(self, config: HardwareConfig) -> None:
+        if config.hand != "right":
+            raise RuntimeError(
+                "RpsHandController is only calibrated for the right Inspire hand."
+            )
+        self._config = config
+        self._session = None
+        self._lock = threading.Lock()
+        # Default to "all open" until we read real state in `open()`.
+        self._current_channels: tuple[float, float, float, float, float, float] = (
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        )
+        self._inactive_channels: tuple[float, float, float, float, float, float] = (
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        )
+
+    def open(self) -> None:
+        """Connect to DDS and snapshot initial hand state. No-op in dry run."""
+        if not self._config.live:
+            return
+        self._session = _create_dds_session(self._config)
+        initial_state = _require_initial_state(self._session, self._config)
+        self._current_channels = extract_hand_channels_from_state(
+            initial_state, self._config.hand
+        )
+        inactive_hand = "left" if self._config.hand == "right" else "right"
+        self._inactive_channels = extract_hand_channels_from_state(
+            initial_state, inactive_hand
+        )
+
+    def transition_to(
+        self, gesture: str, *, transition_seconds: float | None = None
+    ) -> None:
+        """Interpolate the active hand to the named gesture (synchronous).
+
+        Safe to call from a worker thread; concurrent calls are serialized.
+        """
+        target = build_hardware_channels(gesture)
+        with self._lock:
+            if self._session is not None:
+                cfg = self._config
+                if transition_seconds is not None:
+                    cfg = replace(cfg, transition_seconds=transition_seconds)
+                _interpolate_and_publish(
+                    self._session,
+                    self._current_channels,
+                    target,
+                    self._inactive_channels,
+                    cfg,
+                )
+            self._current_channels = target
+
+    def close(self) -> None:
+        """Stop holding the DDS session. Idempotent."""
+        # cyclonedds objects clean themselves up on GC; just drop the reference.
+        self._session = None

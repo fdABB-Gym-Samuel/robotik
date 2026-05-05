@@ -11,13 +11,13 @@ Pipeline:
   4. While waiting for input, the main thread keeps publishing the ready pose
      so the lowcmd watchdog stays satisfied.
   5. On a play: run the pre-reveal rocking motion, randomly pick a robot
-     gesture, "reveal" it (currently just prints to console -- hand control
-     intentionally disabled while we iterate), sample what the camera saw,
-     compute the result, then move into the win pose (robot wins) or the
-     lose pose (anything else). The lose pose is currently a placeholder.
+     gesture, drive the right Inspire hand into that shape (rock/paper/
+     scissors), sample what the camera saw, compute the result, then
+     move into the win pose (robot wins) or the lose pose (anything else).
 
 Subsystems used:
   * Arm:    g1_rps.arm_hardware  (rt/lowcmd, unitree_sdk2py)
+  * Hand:   g1_rps.hardware      (rt/inspire/cmd, cyclonedds)
   * Vision: g1_rps.vision.HandGestureClassifier  (MediaPipe Hand Landmarker)
 
 Prerequisites for --live:
@@ -62,6 +62,7 @@ from g1_rps.arm_hardware import (
     ready_right_arm_pose,
     winning_pose,
 )
+from g1_rps.hardware import HardwareConfig, RpsHandController
 
 ClassifierConfig = None
 HandGestureClassifier = None
@@ -324,10 +325,10 @@ def run_pre_reveal_beats(
 
 
 def reveal_hand_gesture(robot_gesture: str) -> None:
-    """Reveal the robot's chosen gesture.
+    """Print the robot's chosen gesture to the console.
 
-    For now the hand is not actually commanded -- we only print the play to
-    the console while the rest of the pipeline is being wired up.
+    The actual hand motion is driven by `RpsHandController.transition_to`
+    in the round loop; this helper just logs the play.
     """
     print(f"  Robot reveals: {robot_gesture}")
 
@@ -529,6 +530,11 @@ def parse_args() -> argparse.Namespace:
         help="Skip opening the camera and the vision thread.",
     )
     parser.add_argument(
+        "--no-hand",
+        action="store_true",
+        help="Skip Inspire hand control (rt/inspire/cmd). Use this if the hand service isn't running.",
+    )
+    parser.add_argument(
         "--camera",
         choices=("videohub", "front", "back"),
         default="videohub",
@@ -606,6 +612,31 @@ def main() -> int:
     arm_session = UnitreeLowCmdSession(arm_config)
     arm_session.capture_hold_pose()
 
+    # 1b) Inspire hand session (rt/inspire/cmd / rt/inspire/state). The hand
+    # is on a separate DDS topic, independent of the arm low-level controller.
+    hand_controller: RpsHandController | None = None
+    if not args.no_hand:
+        print("Initializing Inspire hand session (rt/inspire/cmd)...")
+        hand_config = HardwareConfig(
+            transition_seconds=0.4,
+            hand="right",
+            domain_id=args.domain_id,
+            network_interface=args.interface,
+            live=args.live,
+            allow_state_fallback=True,
+        )
+        try:
+            hand_controller = RpsHandController(hand_config)
+            hand_controller.open()
+            # Start in a closed fist so the hand looks concealed during pre-reveal.
+            if args.live:
+                hand_controller.transition_to("rock")
+        except Exception as exc:
+            print(
+                f"  warning: Inspire hand control unavailable ({exc}). Continuing without it."
+            )
+            hand_controller = None
+
     # 2) Camera + vision thread. Same channel factory as the arm. Streams for
     #    the entire program lifetime, across all rounds.
     vision_thread: OpponentVisionThread | None = None
@@ -678,11 +709,28 @@ def main() -> int:
             robot_gesture = random.choice(GESTURES)
 
             run_pre_reveal_beats(arm_session, arm_config, ready_pose)
+
+            # Open the hand to the chosen gesture in a worker so the
+            # transition overlaps with the opponent settle window. The
+            # hand is on its own DDS topic, so it doesn't fight the arm
+            # publish loop.
+            hand_thread: threading.Thread | None = None
+            if hand_controller is not None:
+                hand_thread = threading.Thread(
+                    target=hand_controller.transition_to,
+                    args=(robot_gesture,),
+                    daemon=True,
+                )
+                hand_thread.start()
+
             reveal_hand_gesture(robot_gesture)
 
             opponent_gesture, opponent_extended, frames_seen = _sample_opponent_gesture(
                 arm_session, arm_config, ready_pose, vision_thread
             )
+
+            if hand_thread is not None:
+                hand_thread.join(timeout=2.0)
 
             outcome = determine_winner(robot_gesture, opponent_gesture)
             fingers = ",".join(opponent_extended) if opponent_extended else "none"
@@ -695,6 +743,11 @@ def main() -> int:
             run_outcome_pose(
                 arm_session, arm_config, ready_pose, won=(outcome == "robot wins")
             )
+
+            # Close the hand back to a fist so the next round's pre-reveal
+            # starts from a concealed shape.
+            if hand_controller is not None:
+                hand_controller.transition_to("rock")
     except KeyboardInterrupt:
         print("\n(interrupted)")
     finally:
@@ -702,6 +755,9 @@ def main() -> int:
         # instant we stop publishing.
         if args.live:
             _hold_pose(arm_session, arm_config, ready_pose, arm_config.release_duration)
+
+        if hand_controller is not None:
+            hand_controller.close()
 
         if vision_thread is not None:
             vision_thread.stop()
