@@ -215,15 +215,33 @@ def joint_motion_table(params: MotionParameters) -> str:
 class SimulatorArmInterface(JointInterface):
     """Simulator-side implementation with joint-limit safety clamps."""
 
-    def __init__(self, xml_path: Path, control_dt: float) -> None:
+    def __init__(
+        self,
+        xml_path: Path,
+        control_dt: float,
+        *,
+        skip_runtime_prep: bool = False,
+    ) -> None:
         self._mujoco = mujoco
         if not xml_path.exists():
             raise SystemExit(f"Unitree G1 scene not found: {xml_path}")
-        runtime_scene = ensure_runtime_scene(xml_path)
-        self.model = self._mujoco.MjModel.from_xml_path(str(runtime_scene))
+        # `skip_runtime_prep` lets callers load formats that MuJoCo handles
+        # natively (e.g. URDFs with embedded `<mujoco>` blocks) without going
+        # through the inline-mesh runtime XML preparation, which is specific
+        # to the MJCF format.
+        scene_path = xml_path if skip_runtime_prep else ensure_runtime_scene(xml_path)
+        self.model = self._mujoco.MjModel.from_xml_path(str(scene_path))
         self.data = self._mujoco.MjData(self.model)
         self.control_dt = control_dt
         self.current_targets = setup_pose(MotionParameters())
+        # Detect whether the model has a floating base (root free joint) so we
+        # know whether `qpos[:7]` is the floating-base pose or the first joint
+        # angles. URDF-loaded models typically have no free joint and would
+        # otherwise get their first leg joints clobbered by the standing-pose
+        # write below.
+        self._has_floating_base = self.model.njnt > 0 and int(
+            self.model.jnt_type[0]
+        ) == int(mujoco.mjtJoint.mjJNT_FREE)
         # The passive viewer renders from `self.data` on the main thread while
         # the motion runner mutates it on a worker thread. We hold the
         # viewer-provided lock around every mutation to avoid
@@ -259,7 +277,8 @@ class SimulatorArmInterface(JointInterface):
         with lock_ctx:
             self.data.qpos[:] = 0.0
             self.data.qvel[:] = 0.0
-            self.data.qpos[:7] = [0.0, 0.0, 0.79, 1.0, 0.0, 0.0, 0.0]
+            if self._has_floating_base:
+                self.data.qpos[:7] = [0.0, 0.0, 0.79, 1.0, 0.0, 0.0, 0.0]
 
             for joint_name, angle in joint_targets.items():
                 joint_id = self._joint_id(joint_name)

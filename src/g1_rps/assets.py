@@ -68,14 +68,37 @@ def ensure_unitree_g1_assets(asset_root: Path | None = None) -> Path:
 
 
 def _prepare_hand_runtime_model(hand_urdf_path: Path, runtime_model_path: Path) -> Path:
+    return urdf_to_mujoco_runtime_xml(
+        hand_urdf_path,
+        runtime_model_path,
+        model_name="unitree_inspire_right_hand",
+        freejoint_name="hand_freejoint",
+    )
+
+
+def urdf_to_mujoco_runtime_xml(
+    urdf_path: Path,
+    runtime_model_path: Path,
+    *,
+    model_name: str = "robot",
+    freejoint_name: str = "floating_base",
+) -> Path:
+    """Convert a URDF into a runtime MJCF with all meshes inlined.
+
+    MuJoCo's STL decoder isn't enabled in every build, so we read each
+    mesh with `trimesh` and embed the vertex/face data directly into the
+    output XML. The resulting MJCF is fully self-contained and can be
+    loaded with `MjModel.from_xml_path` regardless of the host's MuJoCo
+    build flags.
+    """
     if (
         runtime_model_path.exists()
-        and runtime_model_path.stat().st_mtime >= hand_urdf_path.stat().st_mtime
+        and runtime_model_path.stat().st_mtime >= urdf_path.stat().st_mtime
     ):
         return runtime_model_path
 
-    robot_root = ElementTree.parse(hand_urdf_path).getroot()
-    model_dir = hand_urdf_path.parent
+    robot_root = ElementTree.parse(urdf_path).getroot()
+    model_dir = urdf_path.parent
 
     links = {link.get("name"): link for link in robot_root.findall("link")}
     joints = [joint for joint in robot_root.findall("joint")]
@@ -89,7 +112,7 @@ def _prepare_hand_runtime_model(hand_urdf_path: Path, runtime_model_path: Path) 
 
     root_link_name = next(name for name in links if name not in child_link_names)
 
-    mujoco_root = ElementTree.Element("mujoco", {"model": "unitree_inspire_right_hand"})
+    mujoco_root = ElementTree.Element("mujoco", {"model": model_name})
     ElementTree.SubElement(mujoco_root, "compiler", {"angle": "radian"})
     option = ElementTree.SubElement(
         mujoco_root, "option", {"gravity": "0 0 0", "timestep": "0.005"}
@@ -109,7 +132,7 @@ def _prepare_hand_runtime_model(hand_urdf_path: Path, runtime_model_path: Path) 
     ElementTree.SubElement(
         base_body,
         "freejoint",
-        {"name": "hand_freejoint"},
+        {"name": freejoint_name},
     )
     _populate_link_body(base_body, links[root_link_name], mesh_prefix="mesh")
     _build_body_tree(base_body, root_link_name, links, children_by_parent)
